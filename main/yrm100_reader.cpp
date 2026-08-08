@@ -17,6 +17,9 @@ using namespace esp_usb;
 namespace {
 static const char *TAG = "yrm100_reader";
 static constexpr bool kVerboseLogs = false;
+static constexpr uint32_t kInventoryPollIntervalMs = 120;
+static constexpr uint32_t kInventoryTxTimeoutMs = 300;
+static constexpr uint32_t kInventoryErrorBackoffMs = 500;
 
 void logBytes(const char *label, const std::vector<uint8_t> &bytes) {
     char buffer[256] = {0};
@@ -101,9 +104,15 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
         return;
     }
 
+    const size_t epc_len = std::strlen(epc_hex);
+    const char *normalized_epc = epc_hex;
+    if (epc_len > app_config::kYrm100TagTrailingHexDigits) {
+        normalized_epc = epc_hex + (epc_len - app_config::kYrm100TagTrailingHexDigits);
+    }
+
     const uint32_t now_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
     RfidEvent event = {};
-    std::snprintf(event.rfid_id, sizeof(event.rfid_id), "%s", epc_hex);
+    std::snprintf(event.rfid_id, sizeof(event.rfid_id), "%s", normalized_epc);
     std::snprintf(event.reader_id, sizeof(event.reader_id), "yrm100");
     event.tick_ms = now_ms;
     if (s_deduplicator.shouldDrop(event, now_ms)) {
@@ -118,15 +127,15 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
                      static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
     }
 
-    ESP_LOGI(TAG, "read_event epc=%s time=%s", epc_hex, time_buf);
+    ESP_LOGI(TAG, "read_event epc=%s raw_epc=%s time=%s", normalized_epc, epc_hex, time_buf);
     if (s_mqtt_publisher != nullptr) {
         if (s_mqtt_publisher->isConnected()) {
-            const bool published = s_mqtt_publisher->publishTag(epc_hex, time_buf);
+            const bool published = s_mqtt_publisher->publishTag(normalized_epc, time_buf);
             if (!published) {
-                ESP_LOGW(TAG, "MQTT publish failed for EPC %s", epc_hex);
+                ESP_LOGW(TAG, "MQTT publish failed for EPC %s", normalized_epc);
             }
         } else {
-            ESP_LOGI(TAG, "MQTT not connected yet; logged reader event for EPC %s", epc_hex);
+            ESP_LOGI(TAG, "MQTT not connected yet; logged reader event for EPC %s", normalized_epc);
         }
     }
 }
@@ -273,16 +282,6 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
 
     ESP_LOGD(TAG, "Waiting for USB reader...");
 
-    if (!app_config::kEnableRfidReader) {
-        ESP_LOGI(TAG, "RFID reader disabled; deregistering VCP client");
-        if (s_client_handle != nullptr) {
-            usb_host_client_deregister(s_client_handle);
-            s_client_handle = nullptr;
-        }
-        vTaskDelete(nullptr);
-        return;
-    }
-
     ReaderRxState rx_state = {};
     rx_state.len = 0;
     rx_state.consumed = 0;
@@ -378,11 +377,13 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
 
     ESP_LOGI(TAG, "Waiting for reader frames on USB");
     while (true) {
-        const esp_err_t inventory_err = sendReaderFrame(dev, "Inventory", buildInventoryFrame(), 2000);
+        const esp_err_t inventory_err = sendReaderFrame(dev, "Inventory", buildInventoryFrame(), kInventoryTxTimeoutMs);
         if (inventory_err != ESP_OK) {
             ESP_LOGW(TAG, "Inventory command failed: %s", esp_err_to_name(inventory_err));
+            vTaskDelay(pdMS_TO_TICKS(kInventoryErrorBackoffMs));
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(kInventoryPollIntervalMs));
     }
 }
 
@@ -410,7 +411,7 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
 
     usb_host_config_t host_config = {
         .skip_phy_setup = false,
-        .root_port_unpowered = true,
+        .root_port_unpowered = false,
         .intr_flags = ESP_INTR_FLAG_LOWMED,
         .enum_filter_cb = nullptr,
         .fifo_settings_custom = {
@@ -427,10 +428,11 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
         return ret;
     }
 
-    ret = usb_host_lib_set_root_port_power(true);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "usb_host_lib_set_root_port_power failed: %s", esp_err_to_name(ret));
-        return ret;
+    if (!app_config::kEnableRfidReader) {
+        ESP_LOGI(TAG, "RFID reader and VCP client disabled");
+        xTaskCreatePinnedToCore(usbLibDaemonTask, "usb_daemon", 4096, nullptr, 10, nullptr, 0);
+        xTaskCreatePinnedToCore(timeUpdateTask, "time_update", 4096, nullptr, 2, nullptr, 0);
+        return ESP_OK;
     }
 
     usb_host_client_config_t client_config = {

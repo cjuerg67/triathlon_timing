@@ -10,6 +10,7 @@
 #include "rfid_event.hpp"
 #include "time_service.hpp"
 #include "transport_manager.hpp"
+#include "cf_e714_reader.hpp"
 #include "keyboard_reader.hpp"
 #include "yrm100_reader.hpp"
 
@@ -28,11 +29,12 @@ extern "C" void app_main(void) {
     gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
     gpio_set_level(GPIO_NUM_2, 0);
 
-    TransportManager transport_manager;
-    MqttPublisher mqtt_publisher;
-    TimeService time_service;
-    Yrm100Reader reader;
-    KeyboardReader keyboard_reader;
+    static TransportManager transport_manager;
+    static MqttPublisher mqtt_publisher;
+    static TimeService time_service;
+    static Yrm100Reader yrm100_reader;
+    static CfE714Reader cf_e714_reader;
+    static KeyboardReader keyboard_reader;
 
     const bool connected_transport = transport_manager.connectAny();
     const char *broker_uri = brokerForTransport(transport_manager.activeTransport());
@@ -46,9 +48,17 @@ extern "C" void app_main(void) {
         }
     }
 
-    const esp_err_t reader_start_ret = reader.start(&mqtt_publisher);
-    reader.setTimeService(&time_service);
-    ESP_LOGI(TAG, "reader start ret=%d", reader_start_ret);
+    const esp_err_t yrm100_start_ret = yrm100_reader.start(&mqtt_publisher);
+    yrm100_reader.setTimeService(&time_service);
+    ESP_LOGI(TAG, "reader start ret=%d", yrm100_start_ret);
+
+    if (app_config::kEnableCfE714Reader) {
+        const esp_err_t cf_start_ret = cf_e714_reader.start(&mqtt_publisher);
+        cf_e714_reader.setTimeService(&time_service);
+        ESP_LOGI(TAG, "cf_e714 reader start ret=%d", cf_start_ret);
+    } else {
+        ESP_LOGI(TAG, "cf_e714 reader disabled in config");
+    }
 
     const esp_err_t kb_start_ret = keyboard_reader.start(&mqtt_publisher, &time_service);
     ESP_LOGI(TAG, "keyboard start ret=%d", kb_start_ret);

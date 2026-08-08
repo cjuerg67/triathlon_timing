@@ -9,9 +9,15 @@ static constexpr const char *kMqttBrokerGprs = "mqtt://10.65.240.213";
 static constexpr int kMqttPort = 1883;
 static constexpr const char *kMqttTopicTag = "triathlon/tags";
 static constexpr const char *kMqttTopicTagLast = "triathlon/tags/last";
-static constexpr const char *kMqttTopicGps = "triathlon/gps";    static constexpr const char *kMqttTopicStarter = "triathlon/starter";static constexpr const char *kMqttClientId = "triathlon-timer";
+static constexpr const char *kMqttTopicGps = "triathlon/gps";    
+static constexpr const char *kMqttTopicStarter = "triathlon/starter";
+static constexpr const char *kMqttClientId = "triathlon-timer";
 static constexpr uint32_t kGpsPublishIntervalMs = 30000;
-static constexpr uint32_t kRfidDuplicateDebounceMs = 2000;    static constexpr bool kEnableRfidReader = false;static constexpr uint32_t kMqttReconnectIntervalMs = 5000;
+static constexpr uint32_t kRfidDuplicateDebounceMs = 2000;    
+static constexpr size_t kYrm100TagTrailingHexDigits = 20;
+static constexpr bool kEnableRfidReader = true;
+static constexpr bool kEnableCfE714Reader = false;
+static constexpr uint32_t kMqttReconnectIntervalMs = 5000;
 static constexpr const char *kNtpServer = "pool.ntp.org";
 static constexpr const char *kTimezone = "CET-1CEST,M3.5.0,M10.5.0/3";
 static constexpr const char *kWifiSsid = "***REMOVED***";
@@ -20,5 +26,11 @@ static constexpr uint32_t kWifiConnectTimeoutMs = 10000;
 static constexpr int kC6UartPort = 0;
 static constexpr int kC6UartTxPin = 5;
 static constexpr int kC6UartRxPin = 4;
+
+    // CF-E714 TTL RFID reader — adjust pins to match your board wiring
+    static constexpr int kCfE714UartPort = 1;
+    static constexpr int kCfE714TxPin = 10;
+    static constexpr int kCfE714RxPin = 11;
+    static constexpr int kCfE714BaudRate = 57600;
 
 }  // namespace app_config

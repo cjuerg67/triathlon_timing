@@ -1,8 +1,8 @@
 idf_component_register(
     SRCS
         "app_main.cpp"
+        "cf_e714_reader.cpp"
         "keyboard_reader.cpp"
-        "mqtt_client.c"
         "mqtt_publisher.cpp"
         "rfid_deduplicator.cpp"
         "time_service.cpp"
@@ -20,6 +20,7 @@ idf_component_register(
         esp_driver_uart
         esp_http_client
         app_update
+        mqtt
         lwip
 )
 

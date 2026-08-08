@@ -5,6 +5,9 @@
 
 #include "app_config.hpp"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "usb/hid_host.h"
 
 namespace {
@@ -15,6 +18,28 @@ static TimeService *s_time_service = nullptr;
 static char s_buf[32] = {0};
 static size_t s_buf_len = 0;
 static uint8_t s_prev_keys[6] = {0};
+
+// Publish is offloaded here so the HID callback returns instantly and the USB
+// interrupt-IN URB is resubmitted before the keyboard sends its key-release packet.
+static QueueHandle_t s_publish_queue = nullptr;
+
+static void publishTask(void *) {
+    char number[32];
+    while (true) {
+        if (xQueueReceive(s_publish_queue, number, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "starter number entered: %s", number);
+            if (s_mqtt_publisher != nullptr && s_mqtt_publisher->isConnected()) {
+                char time_buf[16] = "00:00:00";
+                if (s_time_service != nullptr) {
+                    s_time_service->getCurrentTimeHHMMSS(time_buf, sizeof(time_buf));
+                }
+                s_mqtt_publisher->publishStarterNumber(number, time_buf);
+            } else {
+                ESP_LOGW(TAG, "MQTT not connected; dropped starter number %s", number);
+            }
+        }
+    }
+}
 
 static char keycodeToChar(uint8_t keycode) {
     if (keycode >= 0x1E && keycode <= 0x26) return static_cast<char>('1' + (keycode - 0x1E));
@@ -56,15 +81,8 @@ static void processReport(const uint8_t *data, size_t len) {
         } else if (ch == '\n') {
             if (s_buf_len > 0) {
                 s_buf[s_buf_len] = '\0';
-                ESP_LOGI(TAG, "starter number entered: %s", s_buf);
-                if (s_mqtt_publisher != nullptr && s_mqtt_publisher->isConnected()) {
-                    char time_buf[16] = "00:00:00";
-                    if (s_time_service != nullptr) {
-                        s_time_service->getCurrentTimeHHMMSS(time_buf, sizeof(time_buf));
-                    }
-                    s_mqtt_publisher->publishStarterNumber(s_buf, time_buf);
-                } else {
-                    ESP_LOGW(TAG, "MQTT not connected; dropped starter number %s", s_buf);
+                if (s_publish_queue != nullptr) {
+                    xQueueSend(s_publish_queue, s_buf, 0);
                 }
                 s_buf_len = 0;
                 std::memset(s_buf, 0, sizeof(s_buf));
@@ -135,6 +153,8 @@ esp_err_t KeyboardReader::start(MqttPublisher *mqtt_publisher, TimeService *time
     s_mqtt_publisher = mqtt_publisher;
     s_time_service = time_service;
 
+    s_publish_queue = xQueueCreate(4, sizeof(s_buf));
+
     const hid_host_driver_config_t config = {
         .create_background_task = true,
         .task_priority = 5,
@@ -146,8 +166,9 @@ esp_err_t KeyboardReader::start(MqttPublisher *mqtt_publisher, TimeService *time
     const esp_err_t ret = hid_host_install(&config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "hid_host_install failed: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "HID keyboard driver started");
+        return ret;
     }
+    xTaskCreate(publishTask, "kb_publish", 4096, nullptr, 4, nullptr);
+    ESP_LOGI(TAG, "HID keyboard driver started");
     return ret;
 }

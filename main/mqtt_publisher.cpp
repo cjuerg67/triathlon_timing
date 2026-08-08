@@ -5,9 +5,14 @@
 #include "app_config.hpp"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "rfid_deduplicator.hpp"
 
 namespace {
 static const char *TAG = "mqtt_publisher";
+static RfidDeduplicator s_publish_deduplicator(app_config::kRfidDuplicateDebounceMs);
+static SemaphoreHandle_t s_publish_dedup_mutex = nullptr;
 }
 
 esp_err_t MqttPublisher::start(const char *broker_uri, const char *client_id) {
@@ -15,7 +20,7 @@ esp_err_t MqttPublisher::start(const char *broker_uri, const char *client_id) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (client_ != nullptr && std::strncmp(broker_uri_, broker_uri, sizeof(broker_uri_)) == 0) {
+    if (client_ != nullptr && connected_ && std::strncmp(broker_uri_, broker_uri, sizeof(broker_uri_)) == 0) {
         return ESP_OK;
     }
 
@@ -30,6 +35,8 @@ esp_err_t MqttPublisher::start(const char *broker_uri, const char *client_id) {
     mqtt_cfg.broker.address.uri = broker_uri;
     mqtt_cfg.session.last_will.topic = nullptr;
     mqtt_cfg.credentials.client_id = client_id;
+
+    connected_ = false;
 
     client_ = esp_mqtt_client_init(&mqtt_cfg);
     if (client_ == nullptr) {
@@ -62,6 +69,29 @@ bool MqttPublisher::publishTag(const char *rfid_id, const char *hhmmss) {
         return false;
     }
 
+    if (s_publish_dedup_mutex == nullptr) {
+        s_publish_dedup_mutex = xSemaphoreCreateMutex();
+        if (s_publish_dedup_mutex == nullptr) {
+            ESP_LOGW(TAG, "Failed to create publish dedup mutex");
+            return false;
+        }
+    }
+
+    const uint32_t now_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    RfidEvent outbound_event = {};
+    std::snprintf(outbound_event.reader_id, sizeof(outbound_event.reader_id), "%s", "mqtt_out");
+    std::snprintf(outbound_event.rfid_id, sizeof(outbound_event.rfid_id), "%s", rfid_id);
+    outbound_event.tick_ms = now_ms;
+
+    if (xSemaphoreTake(s_publish_dedup_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        const bool drop = s_publish_deduplicator.shouldDrop(outbound_event, now_ms);
+        xSemaphoreGive(s_publish_dedup_mutex);
+        if (drop) {
+            ESP_LOGD(TAG, "Suppressed duplicate publish for EPC %s", rfid_id);
+            return true;
+        }
+    }
+
     if (!connected_) {
         ESP_LOGI(TAG, "MQTT not connected; skipping publish for EPC %s", rfid_id);
         return false;
@@ -72,7 +102,7 @@ bool MqttPublisher::publishTag(const char *rfid_id, const char *hhmmss) {
 
     const int msg_id_event = esp_mqtt_client_publish(client_, app_config::kMqttTopicTag, payload, 0, 0, 0);
     const int msg_id_last = esp_mqtt_client_publish(client_, app_config::kMqttTopicTagLast, payload, 0, 0, 1);
-    ESP_LOGI(TAG, "publishTag epc=%s msg_id_event=%d msg_id_last=%d", rfid_id, msg_id_event, msg_id_last);
+    ESP_LOGI(TAG, "publishTag epc=%s msg_id_event=%d msg_id_last=%d msg_Topic=%s", rfid_id, msg_id_event, msg_id_last, app_config::kMqttTopicTag);
     return msg_id_event >= 0 && msg_id_last >= 0;
 }
 
@@ -107,6 +137,7 @@ bool MqttPublisher::publishStarterNumber(const char *number, const char *hhmmss)
 
 void MqttPublisher::mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     (void)base;
+    (void)event_data;
 
     auto *self = static_cast<MqttPublisher *>(handler_args);
     if (self == nullptr) {
@@ -114,6 +145,10 @@ void MqttPublisher::mqttEventHandler(void *handler_args, esp_event_base_t base, 
     }
 
     switch (event_id) {
+    case MQTT_EVENT_BEFORE_CONNECT:
+        self->connected_ = false;
+        ESP_LOGI(TAG, "MQTT connecting to %s", self->broker_uri_);
+        break;
     case MQTT_EVENT_CONNECTED:
         self->connected_ = true;
         ESP_LOGI(TAG, "MQTT connected");
@@ -121,6 +156,10 @@ void MqttPublisher::mqttEventHandler(void *handler_args, esp_event_base_t base, 
     case MQTT_EVENT_DISCONNECTED:
         self->connected_ = false;
         ESP_LOGW(TAG, "MQTT disconnected");
+        break;
+    case MQTT_EVENT_ERROR:
+        self->connected_ = false;
+        ESP_LOGE(TAG, "MQTT connection error for %s", self->broker_uri_);
         break;
     default:
         ESP_LOGD(TAG, "MQTT event %d", static_cast<int>(event_id));
