@@ -94,6 +94,17 @@ bool MqttPublisher::publishGpsStatus(const char *hhmmss, TimeSource source) {
     return esp_mqtt_client_publish(client_, app_config::kMqttTopicGps, payload, 0, 0, 0) >= 0;
 }
 
+bool MqttPublisher::publishStarterNumber(const char *number, const char *hhmmss) {
+    if (client_ == nullptr || !connected_ || number == nullptr || hhmmss == nullptr) {
+        return false;
+    }
+    char payload[128] = {0};
+    std::snprintf(payload, sizeof(payload), "{\"starter_number\":\"%s\",\"time\":\"%s\"}", number, hhmmss);
+    const int msg_id = esp_mqtt_client_publish(client_, app_config::kMqttTopicStarter, payload, 0, 0, 0);
+    ESP_LOGI(TAG, "publishStarterNumber number=%s msg_id=%d", number, msg_id);
+    return msg_id >= 0;
+}
+
 void MqttPublisher::mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     (void)base;
 

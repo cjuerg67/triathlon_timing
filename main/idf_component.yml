@@ -3,7 +3,8 @@
 dependencies:
   espressif/usb_host_vcp: '*'
   espressif/usb_host_ch34x_vcp: '*'
-  espressif/usb_host_cp210x_vcp: '*'
+  ## espressif/usb_host_cp210x_vcp: '*'
+  espressif/usb_host_hid: '*'
 
   espressif/esp_wifi_remote:
     matches:

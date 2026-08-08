@@ -10,6 +10,7 @@
 #include "rfid_event.hpp"
 #include "time_service.hpp"
 #include "transport_manager.hpp"
+#include "keyboard_reader.hpp"
 #include "yrm100_reader.hpp"
 
 namespace {
@@ -31,6 +32,7 @@ extern "C" void app_main(void) {
     MqttPublisher mqtt_publisher;
     TimeService time_service;
     Yrm100Reader reader;
+    KeyboardReader keyboard_reader;
 
     const bool connected_transport = transport_manager.connectAny();
     const char *broker_uri = brokerForTransport(transport_manager.activeTransport());
@@ -47,6 +49,9 @@ extern "C" void app_main(void) {
     const esp_err_t reader_start_ret = reader.start(&mqtt_publisher);
     reader.setTimeService(&time_service);
     ESP_LOGI(TAG, "reader start ret=%d", reader_start_ret);
+
+    const esp_err_t kb_start_ret = keyboard_reader.start(&mqtt_publisher, &time_service);
+    ESP_LOGI(TAG, "keyboard start ret=%d", kb_start_ret);
 
     int loop_count = 0;
     while (true) {

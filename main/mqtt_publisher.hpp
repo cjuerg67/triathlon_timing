@@ -11,6 +11,7 @@ public:
     esp_err_t start(const char *broker_uri, const char *client_id);
     bool isConnected() const;
     bool publishTag(const char *rfid_id, const char *hhmmss);
+    bool publishStarterNumber(const char *number, const char *hhmmss);
     bool publishGpsStatus(const char *hhmmss, TimeSource source);
 
 private:

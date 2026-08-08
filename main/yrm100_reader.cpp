@@ -273,6 +273,16 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
 
     ESP_LOGD(TAG, "Waiting for USB reader...");
 
+    if (!app_config::kEnableRfidReader) {
+        ESP_LOGI(TAG, "RFID reader disabled; deregistering VCP client");
+        if (s_client_handle != nullptr) {
+            usb_host_client_deregister(s_client_handle);
+            s_client_handle = nullptr;
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+
     ReaderRxState rx_state = {};
     rx_state.len = 0;
     rx_state.consumed = 0;
@@ -281,7 +291,7 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
     rx_state.last_cmd = 0;
 
     cdc_acm_host_device_config_t dev_cfg = {
-        .connection_timeout_ms = 8000,
+        .connection_timeout_ms = 3000,
         .out_buffer_size = 64,
         .in_buffer_size = 64,
         .event_cb = nullptr,
@@ -292,6 +302,11 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
     CdcAcmDevice *dev = VCP::open(NANJING_QINHENG_MICROE_VID, CH340_PID_1, &dev_cfg, 0);
     if (dev == nullptr) {
         ESP_LOGW(TAG, "No YRM100/CH34x reader detected");
+        // Deregister so the VCP client no longer intercepts USB events (e.g. keyboard).
+        if (s_client_handle != nullptr) {
+            usb_host_client_deregister(s_client_handle);
+            s_client_handle = nullptr;
+        }
         vTaskDelete(nullptr);
         return;
     }
@@ -420,7 +435,7 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
 
     usb_host_client_config_t client_config = {
         .is_synchronous = false,
-        .max_num_event_msg = 3,
+        .max_num_event_msg = 16,
         .flags = {
             .notify_dev_removed = 0,
             .reserved31 = 0,

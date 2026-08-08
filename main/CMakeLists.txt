@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "app_main.cpp"
+        "keyboard_reader.cpp"
         "mqtt_client.c"
         "mqtt_publisher.cpp"
         "rfid_deduplicator.cpp"

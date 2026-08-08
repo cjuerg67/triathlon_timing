@@ -5,6 +5,9 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 # Required by espressif USB host VCP C++ components.
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 
+# Enable USB hub support for CH334F on-board hub.
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
 # This board is ESP32-P4 rev 1.x, so use the <3.0 silicon branch.
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_100=y
