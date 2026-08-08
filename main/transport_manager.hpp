@@ -34,6 +34,8 @@ private:
     bool ethernet_initialized_ = false;
     bool ethernet_link_up_ = false;
     bool ethernet_got_ip_ = false;
+    bool gprs_initialized_ = false;
+    bool gprs_ready_ = false;
     esp_netif_t *wifi_netif_ = nullptr;
     esp_eth_handle_t ethernet_handle_ = nullptr;
     esp_netif_t *ethernet_netif_ = nullptr;

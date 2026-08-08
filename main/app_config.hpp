@@ -17,6 +17,7 @@ static constexpr uint32_t kRfidDuplicateDebounceMs = 2000;
 static constexpr size_t kYrm100TagTrailingHexDigits = 20;
 static constexpr bool kEnableRfidReader = true;
 static constexpr bool kEnableCfE714Reader = false;
+static constexpr bool kEnableGprsTransport = true;
 static constexpr uint32_t kMqttReconnectIntervalMs = 5000;
 static constexpr const char *kNtpServer = "pool.ntp.org";
 static constexpr const char *kTimezone = "CET-1CEST,M3.5.0,M10.5.0/3";
@@ -26,6 +27,14 @@ static constexpr uint32_t kWifiConnectTimeoutMs = 10000;
 static constexpr int kC6UartPort = 0;
 static constexpr int kC6UartTxPin = 5;
 static constexpr int kC6UartRxPin = 4;
+
+static constexpr int kSim7000UartPort = 2;
+static constexpr int kSim7000UartTxPin = 23;
+static constexpr int kSim7000UartRxPin = 22;
+static constexpr int kSim7000UartBaudRate = 115200;
+static constexpr const char *kSim7000Apn = "internet";
+static constexpr const char *kSim7000ApnUser = "";
+static constexpr const char *kSim7000ApnPassword = "";
 
     // CF-E714 TTL RFID reader — adjust pins to match your board wiring
     static constexpr int kCfE714UartPort = 1;

@@ -1,8 +1,10 @@
 #include "transport_manager.hpp"
 
+#include <cstdio>
 #include <cstring>
 
 #include "app_config.hpp"
+#include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -17,6 +19,86 @@ static bool s_netif_initialized = false;
 static bool s_event_loop_initialized = false;
 static bool s_eth_handlers_registered = false;
 static bool s_wifi_handlers_registered = false;
+
+bool readUartLine(uart_port_t port, char *line, size_t line_size, uint32_t timeout_ms) {
+    if (line == nullptr || line_size < 2) {
+        return false;
+    }
+
+    line[0] = '\0';
+    size_t used = 0;
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        uint8_t ch = 0;
+        const int read = uart_read_bytes(port, &ch, 1, pdMS_TO_TICKS(20));
+        if (read <= 0) {
+            continue;
+        }
+
+        if (ch == '\r') {
+            continue;
+        }
+
+        if (ch == '\n') {
+            if (used == 0) {
+                continue;
+            }
+            line[used] = '\0';
+            return true;
+        }
+
+        if (used < (line_size - 1)) {
+            line[used++] = static_cast<char>(ch);
+        }
+    }
+
+    if (used > 0) {
+        line[used] = '\0';
+        return true;
+    }
+    return false;
+}
+
+bool sim7000Command(uart_port_t port,
+                    const char *cmd,
+                    uint32_t timeout_ms,
+                    char *first_data_line,
+                    size_t first_data_line_size) {
+    if (cmd == nullptr) {
+        return false;
+    }
+
+    if (first_data_line != nullptr && first_data_line_size > 0) {
+        first_data_line[0] = '\0';
+    }
+
+    uart_flush(port);
+    (void)uart_write_bytes(port, cmd, std::strlen(cmd));
+    (void)uart_write_bytes(port, "\r\n", 2);
+
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        char line[160] = {0};
+        if (!readUartLine(port, line, sizeof(line), 200)) {
+            continue;
+        }
+
+        if (std::strcmp(line, "OK") == 0) {
+            return true;
+        }
+        if (std::strcmp(line, "ERROR") == 0 || std::strstr(line, "+CME ERROR") != nullptr) {
+            ESP_LOGW(TAG, "SIM7000 cmd failed: %s -> %s", cmd, line);
+            return false;
+        }
+
+        if (first_data_line != nullptr && first_data_line_size > 0 && first_data_line[0] == '\0') {
+            std::snprintf(first_data_line, first_data_line_size, "%s", line);
+        }
+    }
+
+    ESP_LOGW(TAG, "SIM7000 cmd timeout: %s", cmd);
+    return false;
+}
 }  // namespace
 
 bool TransportManager::connectAny() {
@@ -295,13 +377,91 @@ bool TransportManager::ensureEthernetConnection() {
 }
 
 bool TransportManager::ensureGprsConnection() {
-    if (!gprs_enabled_) {
+    if (!app_config::kEnableGprsTransport || !gprs_enabled_) {
         ESP_LOGI(TAG, "GPRS transport disabled; skipping initialization");
         return false;
     }
 
-    ESP_LOGI(TAG, "GPRS transport is not configured in the current build; Wi-Fi will be used when available");
-    return false;
+    if (gprs_initialized_) {
+        return gprs_ready_;
+    }
+
+    const uart_port_t port = static_cast<uart_port_t>(app_config::kSim7000UartPort);
+    if (!uart_is_driver_installed(port)) {
+        const esp_err_t install_ret = uart_driver_install(port, 4096, 512, 0, nullptr, 0);
+        if (install_ret != ESP_OK) {
+            ESP_LOGE(TAG, "SIM7000 UART driver install failed: %s", esp_err_to_name(install_ret));
+            gprs_initialized_ = true;
+            gprs_ready_ = false;
+            return false;
+        }
+    }
+
+    const uart_config_t uart_cfg = {
+        .baud_rate = app_config::kSim7000UartBaudRate,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_DEFAULT,
+        .flags = {.allow_pd = 0, .backup_before_sleep = 0},
+    };
+
+    if (uart_param_config(port, &uart_cfg) != ESP_OK ||
+        uart_set_pin(port,
+                     app_config::kSim7000UartTxPin,
+                     app_config::kSim7000UartRxPin,
+                     UART_PIN_NO_CHANGE,
+                     UART_PIN_NO_CHANGE) != ESP_OK) {
+        ESP_LOGE(TAG, "SIM7000 UART config failed");
+        gprs_initialized_ = true;
+        gprs_ready_ = false;
+        return false;
+    }
+
+    char line[160] = {0};
+    if (!sim7000Command(port, "AT", 2000, nullptr, 0) ||
+        !sim7000Command(port, "ATE0", 2000, nullptr, 0)) {
+        ESP_LOGW(TAG, "SIM7000 not responding to AT");
+        gprs_initialized_ = true;
+        gprs_ready_ = false;
+        return false;
+    }
+
+    if (!sim7000Command(port, "AT+CPIN?", 4000, line, sizeof(line)) ||
+        std::strstr(line, "READY") == nullptr) {
+        ESP_LOGW(TAG, "SIM7000 SIM not ready: %s", line);
+        gprs_initialized_ = true;
+        gprs_ready_ = false;
+        return false;
+    }
+
+    (void)sim7000Command(port, "AT+CSQ", 2000, line, sizeof(line));
+
+    char pdp_cmd[196] = {0};
+    std::snprintf(pdp_cmd, sizeof(pdp_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", app_config::kSim7000Apn);
+    if (!sim7000Command(port, "AT+CGATT=1", 20000, nullptr, 0) ||
+        !sim7000Command(port, pdp_cmd, 5000, nullptr, 0) ||
+        !sim7000Command(port, "AT+CGACT=1,1", 30000, nullptr, 0) ||
+        !sim7000Command(port, "AT+CGPADDR=1", 5000, line, sizeof(line))) {
+        ESP_LOGW(TAG, "SIM7000 PDP activation failed");
+        gprs_initialized_ = true;
+        gprs_ready_ = false;
+        return false;
+    }
+
+    if (std::strstr(line, "0.0.0.0") != nullptr) {
+        ESP_LOGW(TAG, "SIM7000 PDP has no valid IP: %s", line);
+        gprs_initialized_ = true;
+        gprs_ready_ = false;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "SIM7000 GPRS attached: %s", line);
+    gprs_initialized_ = true;
+    gprs_ready_ = true;
+    return true;
 }
 
 void TransportManager::wifiEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {

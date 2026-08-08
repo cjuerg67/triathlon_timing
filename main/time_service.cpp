@@ -14,8 +14,6 @@
 
 namespace {
 static const char *TAG = "time_service";
-static constexpr int kGsmRxPin = 22;
-static constexpr int kGsmTxPin = 23;
 static constexpr int kUartRxBufferSize = 2048;
 static constexpr int kUartTxBufferSize = 512;
 
@@ -39,7 +37,7 @@ static void utcToLocal(int &hour, int &minute, int &second) {
 
 TimeService::TimeService() {
     const uart_config_t uart_cfg = {
-        .baud_rate = 115200,
+        .baud_rate = app_config::kSim7000UartBaudRate,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -62,7 +60,11 @@ TimeService::TimeService() {
         return;
     }
 
-    if (uart_set_pin(static_cast<uart_port_t>(uart_port_), kGsmTxPin, kGsmRxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
+    if (uart_set_pin(static_cast<uart_port_t>(uart_port_),
+                     app_config::kSim7000UartTxPin,
+                     app_config::kSim7000UartRxPin,
+                     UART_PIN_NO_CHANGE,
+                     UART_PIN_NO_CHANGE) != ESP_OK) {
         ESP_LOGW(TAG, "SIM7000 UART pin config failed");
         return;
     }

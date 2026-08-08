@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "app_config.hpp"
+
 enum class TimeSource {
     kGps,
     kNtp,
@@ -24,7 +26,7 @@ private:
     bool tryGetNtpTime(int &hour, int &minute, int &second) const;
     bool tryGetGsmNetworkTime(int &hour, int &minute, int &second) const;
 
-    int uart_port_ = 2;
+    int uart_port_ = app_config::kSim7000UartPort;
     bool uart_initialized_ = false;
     bool ntp_initialized_ = false;
     mutable bool ntp_synced_ = false;
