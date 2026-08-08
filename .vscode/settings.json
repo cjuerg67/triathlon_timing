@@ -1,0 +1,14 @@
+{
+  "idf.currentSetup": "M:\\esp\\v6.0.2\\esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=m:/Source/_Zeitmessung/sim7000g_sample/triathlon_timing/build"
+  ],
+  "idf.flashType": "UART",
+  "idf.portWin": "COM10"
+}
