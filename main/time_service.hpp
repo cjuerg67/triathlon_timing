@@ -5,6 +5,7 @@
 
 enum class TimeSource {
     kGps,
+    kNtp,
     kGsm,
     kFallback,
 };
@@ -12,6 +13,7 @@ enum class TimeSource {
 class TimeService {
 public:
     TimeService();
+    void initNtp();
     TimeSource getCurrentTimeHHMMSS(char *out, size_t out_size) const;
 
 private:
@@ -19,9 +21,12 @@ private:
     bool parseGsmClock(const char *line, int &hour, int &minute, int &second) const;
     bool parseGnsUtc(const char *line, int &hour, int &minute, int &second) const;
     bool tryGetGpsTime(int &hour, int &minute, int &second) const;
+    bool tryGetNtpTime(int &hour, int &minute, int &second) const;
     bool tryGetGsmNetworkTime(int &hour, int &minute, int &second) const;
 
     int uart_port_ = 2;
     bool uart_initialized_ = false;
+    bool ntp_initialized_ = false;
+    mutable bool ntp_synced_ = false;
     mutable bool gps_power_enabled_ = false;
 };

@@ -10,5 +10,9 @@
     "--compile-commands-dir=m:/Source/_Zeitmessung/sim7000g_sample/triathlon_timing/build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM10"
+  "idf.portWin": "COM10",
+  "idf.monitorPort": "COM10",
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ]
 }

@@ -37,6 +37,7 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "transport connected=%d broker=%s", connected_transport, broker_uri != nullptr ? broker_uri : "null");
 
     if (connected_transport) {
+        time_service.initNtp();
         const esp_err_t mqtt_start_ret = mqtt_publisher.start(broker_uri, app_config::kMqttClientId);
         if (mqtt_start_ret != ESP_OK) {
             ESP_LOGW(TAG, "MQTT init deferred: %s", esp_err_to_name(mqtt_start_ret));
@@ -44,6 +45,7 @@ extern "C" void app_main(void) {
     }
 
     const esp_err_t reader_start_ret = reader.start(&mqtt_publisher);
+    reader.setTimeService(&time_service);
     ESP_LOGI(TAG, "reader start ret=%d", reader_start_ret);
 
     int loop_count = 0;

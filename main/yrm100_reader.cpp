@@ -7,7 +7,9 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "app_config.hpp"
 #include "rfid_event.hpp"
+#include "rfid_deduplicator.hpp"
 #include "usb/vcp_ch34x.hpp"
 
 using namespace esp_usb;
@@ -35,7 +37,11 @@ struct ProbeCommand {
 }
 
 MqttPublisher *Yrm100Reader::s_mqtt_publisher = nullptr;
+TimeService *Yrm100Reader::s_time_service = nullptr;
 usb_host_client_handle_t Yrm100Reader::s_client_handle = nullptr;
+char Yrm100Reader::s_cached_time[16] = "00:00:00";
+TimeSource Yrm100Reader::s_cached_time_src = TimeSource::kFallback;
+static RfidDeduplicator s_deduplicator(app_config::kRfidDuplicateDebounceMs);
 
 std::vector<uint8_t> Yrm100Reader::buildYrm100Frame(uint8_t msg_type, uint8_t cmd_code, const std::vector<uint8_t> &data) {
     std::vector<uint8_t> frame;
@@ -95,8 +101,22 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
         return;
     }
 
+    const uint32_t now_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    RfidEvent event = {};
+    std::snprintf(event.rfid_id, sizeof(event.rfid_id), "%s", epc_hex);
+    std::snprintf(event.reader_id, sizeof(event.reader_id), "yrm100");
+    event.tick_ms = now_ms;
+    if (s_deduplicator.shouldDrop(event, now_ms)) {
+        return;
+    }
+
     char time_buf[16] = {0};
-    std::snprintf(time_buf, sizeof(time_buf), "%lu", static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
+    // use pre-resolved cache; calling time service here blocks the USB callback
+    std::snprintf(time_buf, sizeof(time_buf), "%s", s_cached_time);
+    if (s_cached_time_src == TimeSource::kFallback) {
+        std::snprintf(time_buf, sizeof(time_buf), "%lu",
+                     static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
+    }
 
     ESP_LOGI(TAG, "read_event epc=%s time=%s", epc_hex, time_buf);
     if (s_mqtt_publisher != nullptr) {
@@ -351,6 +371,25 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
     }
 }
 
+void Yrm100Reader::timeUpdateTask(void *pvParameters) {
+    (void)pvParameters;
+    while (true) {
+        if (s_time_service != nullptr) {
+            s_cached_time_src = s_time_service->getCurrentTimeHHMMSS(s_cached_time, sizeof(s_cached_time));
+            const char *src_name = (s_cached_time_src == TimeSource::kGps) ? "GPS"
+                                 : (s_cached_time_src == TimeSource::kNtp) ? "NTP"
+                                 : (s_cached_time_src == TimeSource::kGsm) ? "GSM"
+                                 : "fallback";
+            ESP_LOGI(TAG, "time=%s [%s]", s_cached_time, src_name);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+void Yrm100Reader::setTimeService(TimeService *ts) {
+    s_time_service = ts;
+}
+
 esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
     s_mqtt_publisher = mqtt_publisher;
 
@@ -400,5 +439,6 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
 
     xTaskCreatePinnedToCore(usbLibDaemonTask, "usb_daemon", 4096, nullptr, 10, nullptr, 0);
     xTaskCreatePinnedToCore(rfidTask, "yrm100_task", 8192, nullptr, 5, nullptr, 1);
+    xTaskCreatePinnedToCore(timeUpdateTask, "time_update", 4096, nullptr, 2, nullptr, 0);
     return ESP_OK;
 }

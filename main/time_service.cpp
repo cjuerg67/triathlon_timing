@@ -1,4 +1,5 @@
 #include "time_service.hpp"
+#include "app_config.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -7,6 +8,7 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -16,6 +18,23 @@ static constexpr int kGsmRxPin = 22;
 static constexpr int kGsmTxPin = 23;
 static constexpr int kUartRxBufferSize = 2048;
 static constexpr int kUartTxBufferSize = 512;
+
+// Converts UTC h/m/s to local time using the active TZ (requires system clock to be set).
+static void utcToLocal(int &hour, int &minute, int &second) {
+    const std::time_t now = std::time(nullptr);
+    const std::tm *utc_ptr = std::gmtime(&now);
+    if (utc_ptr == nullptr) return;
+    const std::tm utc = *utc_ptr;
+    const std::tm *loc = std::localtime(&now);
+    if (loc == nullptr) return;
+    int offset_sec = (loc->tm_hour - utc.tm_hour) * 3600
+                   + (loc->tm_min  - utc.tm_min)  * 60;
+    int total = hour * 3600 + minute * 60 + second + offset_sec;
+    total = ((total % 86400) + 86400) % 86400;
+    hour   = total / 3600;
+    minute = (total % 3600) / 60;
+    second = total % 60;
+}
 }
 
 TimeService::TimeService() {
@@ -49,6 +68,22 @@ TimeService::TimeService() {
     }
 
     uart_initialized_ = true;
+
+    setenv("TZ", app_config::kTimezone, 1);
+    tzset();
+    ESP_LOGI(TAG, "Timezone set to %s", app_config::kTimezone);
+}
+
+void TimeService::initNtp() {
+    if (ntp_initialized_) {
+        return;
+    }
+    ESP_LOGI(TAG, "Starting NTP client, server: %s", app_config::kNtpServer);
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, app_config::kNtpServer);
+    esp_sntp_init();
+    ntp_initialized_ = true;
+    ESP_LOGI(TAG, "NTP client started");
 }
 
 TimeSource TimeService::getCurrentTimeHHMMSS(char *out, size_t out_size) const {
@@ -61,11 +96,18 @@ TimeSource TimeService::getCurrentTimeHHMMSS(char *out, size_t out_size) const {
     int second = 0;
 
     if (tryGetGpsTime(hour, minute, second)) {
+        utcToLocal(hour, minute, second);
         std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
         return TimeSource::kGps;
     }
 
+    if (tryGetNtpTime(hour, minute, second)) {
+        std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
+        return TimeSource::kNtp;
+    }
+
     if (tryGetGsmNetworkTime(hour, minute, second)) {
+        utcToLocal(hour, minute, second);
         std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
         return TimeSource::kGsm;
     }
@@ -169,6 +211,32 @@ bool TimeService::parseGnsUtc(const char *line, int &hour, int &minute, int &sec
     hour = (utc[8] - '0') * 10 + (utc[9] - '0');
     minute = (utc[10] - '0') * 10 + (utc[11] - '0');
     second = (utc[12] - '0') * 10 + (utc[13] - '0');
+    return true;
+}
+
+bool TimeService::tryGetNtpTime(int &hour, int &minute, int &second) const {
+    if (!ntp_initialized_) {
+        return false;
+    }
+    if (!ntp_synced_) {
+        const sntp_sync_status_t status = esp_sntp_get_sync_status();
+        if (status != SNTP_SYNC_STATUS_COMPLETED) {
+            ESP_LOGD(TAG, "NTP sync pending (status=%d)", static_cast<int>(status));
+            return false;
+        }
+        ntp_synced_ = true;
+        ESP_LOGI(TAG, "NTP sync completed");
+    }
+    const std::time_t now = std::time(nullptr);
+    const std::tm *tm_now = std::localtime(&now);
+    if (tm_now == nullptr || (tm_now->tm_year + 1900) < 2024) {
+        ESP_LOGW(TAG, "NTP synced but system time looks invalid");
+        return false;
+    }
+    ESP_LOGD(TAG, "NTP time: %02d:%02d:%02d local", tm_now->tm_hour, tm_now->tm_min, tm_now->tm_sec);
+    hour = tm_now->tm_hour;
+    minute = tm_now->tm_min;
+    second = tm_now->tm_sec;
     return true;
 }
 

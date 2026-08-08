@@ -19,6 +19,7 @@ idf_component_register(
         esp_driver_uart
         esp_http_client
         app_update
+        lwip
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -fexceptions)
