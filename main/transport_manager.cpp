@@ -102,37 +102,19 @@ bool sim7000Command(uart_port_t port,
 }  // namespace
 
 bool TransportManager::connectAny() {
-    if (ensureWifiConnection()) {
-        for (int attempt = 0; attempt < 60; ++attempt) {
-            if (wifi_connected_) {
-                active_transport_ = TransportType::kWifi;
-                return true;
-            }
-            vTaskDelay(pdMS_TO_TICKS(250));
-        }
-
-        ESP_LOGW(TAG, "Wi-Fi connection did not become ready in time");
-    }
-
-    if (ensureEthernetConnection()) {
-        for (int attempt = 0; attempt < 40; ++attempt) {
-            if (ethernet_link_up_ && ethernet_got_ip_) {
-                active_transport_ = TransportType::kEthernet;
-                return true;
-            }
-
-            if (attempt == 0) {
-                ESP_LOGI(TAG, "Waiting for Ethernet link and IP address...");
-            }
-            vTaskDelay(pdMS_TO_TICKS(250));
-        }
-
-        ESP_LOGW(TAG, "Ethernet link/IP did not become ready in time after initialization");
-    }
-
-    if (ensureGprsConnection()) {
-        active_transport_ = TransportType::kGprs;
+    // Try immediately using priority wifi > ethernet > gprs.
+    if (refreshActiveTransport()) {
         return true;
+    }
+
+    // Give Wi-Fi/LAN a short chance to come up; keep reevaluating full priority.
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(app_config::kWifiConnectTimeoutMs);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        if (refreshActiveTransport()) {
+            return true;
+        }
     }
 
     active_transport_ = TransportType::kNone;
@@ -141,41 +123,34 @@ bool TransportManager::connectAny() {
 }
 
 bool TransportManager::refreshActiveTransport() {
-    // Keep Wi-Fi initialized for event-driven reconnects; defer Ethernet bring-up until needed.
+    // Keep interfaces initialized and choose best currently available transport.
     (void)ensureWifiConnection();
+    (void)ensureEthernetConnection();
 
     const TransportType previous = active_transport_;
-
-    bool current_healthy = false;
-    switch (active_transport_) {
-    case TransportType::kWifi:
-        current_healthy = wifi_connected_;
-        break;
-    case TransportType::kEthernet:
-        current_healthy = ethernet_link_up_ && ethernet_got_ip_;
-        break;
-    case TransportType::kGprs:
-        current_healthy = ensureGprsConnection();
-        break;
-    case TransportType::kNone:
-    default:
-        current_healthy = false;
-        break;
-    }
-
-    if (current_healthy) {
-        return true;
-    }
-
     if (wifi_connected_) {
+        if (gprs_gate_reason_ != TransportType::kWifi) {
+            ESP_LOGI(TAG, "GPRS not attempted: Wi-Fi is available");
+            gprs_gate_reason_ = TransportType::kWifi;
+        }
         active_transport_ = TransportType::kWifi;
-    } else if ((ethernet_link_up_ && ethernet_got_ip_) ||
-               (ensureEthernetConnection() && ethernet_link_up_ && ethernet_got_ip_)) {
+    } else if (ethernet_link_up_ && ethernet_got_ip_) {
+        if (gprs_gate_reason_ != TransportType::kEthernet) {
+            ESP_LOGI(TAG, "GPRS not attempted: Ethernet is available");
+            gprs_gate_reason_ = TransportType::kEthernet;
+        }
         active_transport_ = TransportType::kEthernet;
-    } else if (ensureGprsConnection()) {
-        active_transport_ = TransportType::kGprs;
     } else {
-        active_transport_ = TransportType::kNone;
+        if (gprs_gate_reason_ != TransportType::kNone) {
+            ESP_LOGI(TAG, "No Wi-Fi/LAN available; attempting GPRS now");
+            gprs_gate_reason_ = TransportType::kNone;
+        }
+
+        if (ensureGprsConnection()) {
+            active_transport_ = TransportType::kGprs;
+        } else {
+            active_transport_ = TransportType::kNone;
+        }
     }
 
     if (active_transport_ != previous) {
@@ -437,6 +412,7 @@ bool TransportManager::ensureGprsConnection() {
     if (gprs_initialized_) {
         if (!gprs_ready_) {
             // Allow retries on later refresh cycles.
+            ESP_LOGW(TAG, "GPRS not ready yet; scheduling a re-attach attempt");
             gprs_initialized_ = false;
             return false;
         }
@@ -453,6 +429,8 @@ bool TransportManager::ensureGprsConnection() {
         }
         return true;
     }
+
+    ESP_LOGI(TAG, "SIM7000 GPRS attach attempt started");
 
     const uart_port_t port = static_cast<uart_port_t>(app_config::kSim7000UartPort);
     if (!uart_is_driver_installed(port)) {

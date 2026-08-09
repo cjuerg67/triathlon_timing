@@ -27,13 +27,14 @@ private:
     static void gotIpEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
     TransportType active_transport_ = TransportType::kNone;
-    bool wifi_enabled_ = true;
+    bool wifi_enabled_ = false;
     bool ethernet_enabled_ = true;
     bool wifi_initialized_ = false;
     bool wifi_connected_ = false;
     bool ethernet_initialized_ = false;
     bool ethernet_link_up_ = false;
     bool ethernet_got_ip_ = false;
+    TransportType gprs_gate_reason_ = TransportType::kNone;
     bool gprs_initialized_ = false;
     bool gprs_ready_ = false;
     esp_netif_t *wifi_netif_ = nullptr;
