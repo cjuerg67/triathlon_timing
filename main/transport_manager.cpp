@@ -140,6 +140,60 @@ bool TransportManager::connectAny() {
     return false;
 }
 
+bool TransportManager::refreshActiveTransport() {
+    // Keep Wi-Fi initialized for event-driven reconnects; defer Ethernet bring-up until needed.
+    (void)ensureWifiConnection();
+
+    const TransportType previous = active_transport_;
+
+    bool current_healthy = false;
+    switch (active_transport_) {
+    case TransportType::kWifi:
+        current_healthy = wifi_connected_;
+        break;
+    case TransportType::kEthernet:
+        current_healthy = ethernet_link_up_ && ethernet_got_ip_;
+        break;
+    case TransportType::kGprs:
+        current_healthy = ensureGprsConnection();
+        break;
+    case TransportType::kNone:
+    default:
+        current_healthy = false;
+        break;
+    }
+
+    if (current_healthy) {
+        return true;
+    }
+
+    if (wifi_connected_) {
+        active_transport_ = TransportType::kWifi;
+    } else if ((ethernet_link_up_ && ethernet_got_ip_) ||
+               (ensureEthernetConnection() && ethernet_link_up_ && ethernet_got_ip_)) {
+        active_transport_ = TransportType::kEthernet;
+    } else if (ensureGprsConnection()) {
+        active_transport_ = TransportType::kGprs;
+    } else {
+        active_transport_ = TransportType::kNone;
+    }
+
+    if (active_transport_ != previous) {
+        ESP_LOGW(TAG, "Active transport changed %d -> %d",
+                 static_cast<int>(previous), static_cast<int>(active_transport_));
+    } else if (app_config::kEnableVerboseTransportLogs) {
+        ESP_LOGI(TAG,
+                 "Transport refresh stable=%d wifi=%d eth_link=%d eth_ip=%d gprs=%d",
+                 static_cast<int>(active_transport_),
+                 wifi_connected_,
+                 ethernet_link_up_,
+                 ethernet_got_ip_,
+                 gprs_ready_);
+    }
+
+    return active_transport_ != TransportType::kNone;
+}
+
 TransportType TransportManager::activeTransport() const {
     return active_transport_;
 }
@@ -355,8 +409,6 @@ bool TransportManager::ensureEthernetConnection() {
         return false;
     }
 
-    esp_netif_set_default_netif(ethernet_netif_);
-
     ret = esp_eth_start(ethernet_handle_);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_eth_start failed: %s", esp_err_to_name(ret));
@@ -377,13 +429,29 @@ bool TransportManager::ensureEthernetConnection() {
 }
 
 bool TransportManager::ensureGprsConnection() {
-    if (!app_config::kEnableGprsTransport || !gprs_enabled_) {
+    if (!app_config::kEnableGprsTransport) {
         ESP_LOGI(TAG, "GPRS transport disabled; skipping initialization");
         return false;
     }
 
     if (gprs_initialized_) {
-        return gprs_ready_;
+        if (!gprs_ready_) {
+            // Allow retries on later refresh cycles.
+            gprs_initialized_ = false;
+            return false;
+        }
+
+        // Lightweight health probe for active sessions.
+        const uart_port_t health_port = static_cast<uart_port_t>(app_config::kSim7000UartPort);
+        char health_line[96] = {0};
+        if (!sim7000Command(health_port, "AT+CGATT?", 2500, health_line, sizeof(health_line)) ||
+            std::strstr(health_line, ": 1") == nullptr) {
+            ESP_LOGW(TAG, "SIM7000 detached from packet domain");
+            gprs_ready_ = false;
+            gprs_initialized_ = false;
+            return false;
+        }
+        return true;
     }
 
     const uart_port_t port = static_cast<uart_port_t>(app_config::kSim7000UartPort);
@@ -506,6 +574,9 @@ void TransportManager::wifiGotIpEventHandler(void *arg, esp_event_base_t event_b
     }
 
     self->wifi_connected_ = true;
+    if (self->wifi_netif_ != nullptr) {
+        esp_netif_set_default_netif(self->wifi_netif_);
+    }
     ESP_LOGI(TAG, "Wi-Fi station received an IP address");
 }
 
@@ -525,6 +596,7 @@ void TransportManager::ethEventHandler(void *arg, esp_event_base_t event_base, i
         break;
     case ETHERNET_EVENT_DISCONNECTED:
         self->ethernet_link_up_ = false;
+        self->ethernet_got_ip_ = false;
         ESP_LOGW(TAG, "Ethernet link disconnected");
         break;
     case ETHERNET_EVENT_START:
@@ -552,5 +624,8 @@ void TransportManager::gotIpEventHandler(void *arg, esp_event_base_t event_base,
     }
 
     self->ethernet_got_ip_ = true;
+    if (self->ethernet_netif_ != nullptr) {
+        esp_netif_set_default_netif(self->ethernet_netif_);
+    }
     ESP_LOGI(TAG, "Ethernet interface received an IP address");
 }

@@ -17,6 +17,20 @@
 namespace {
 static const char *TAG = "triathlon_main";
 
+const char *transportName(TransportType transport) {
+    switch (transport) {
+    case TransportType::kWifi:
+        return "wifi";
+    case TransportType::kEthernet:
+        return "lan";
+    case TransportType::kGprs:
+        return "gprs";
+    case TransportType::kNone:
+    default:
+        return "none";
+    }
+}
+
 const char *brokerForTransport(TransportType transport) {
     return (transport == TransportType::kGprs) ? app_config::kMqttBrokerGprs : app_config::kMqttBrokerLan;
 }
@@ -36,8 +50,9 @@ extern "C" void app_main(void) {
     static CfE714Reader cf_e714_reader;
     static KeyboardReader keyboard_reader;
 
-    const bool connected_transport = transport_manager.connectAny();
-    const char *broker_uri = brokerForTransport(transport_manager.activeTransport());
+    bool connected_transport = transport_manager.connectAny();
+    TransportType active_transport = transport_manager.activeTransport();
+    const char *broker_uri = brokerForTransport(active_transport);
     ESP_LOGI(TAG, "transport connected=%d broker=%s", connected_transport, broker_uri != nullptr ? broker_uri : "null");
 
     if (connected_transport) {
@@ -64,15 +79,80 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "keyboard start ret=%d", kb_start_ret);
 
     int loop_count = 0;
+    TickType_t last_transport_check = 0;
+    TickType_t last_status_log = 0;
+    TickType_t next_mqtt_retry = 0;
+    uint32_t mqtt_retry_interval_ms = app_config::kMqttReconnectIntervalMs;
     while (true) {
         gpio_set_level(GPIO_NUM_2, loop_count % 2);
         loop_count++;
 
-        if (connected_transport && !mqtt_publisher.isConnected() && (loop_count % 50) == 0) {
+        const TickType_t now_ticks = xTaskGetTickCount();
+        if ((now_ticks - last_transport_check) >= pdMS_TO_TICKS(app_config::kTransportRefreshIntervalMs)) {
+            const TransportType previous_transport = active_transport;
+            connected_transport = transport_manager.refreshActiveTransport();
+            active_transport = transport_manager.activeTransport();
+
+            if (connected_transport && active_transport != previous_transport) {
+                broker_uri = brokerForTransport(active_transport);
+                ESP_LOGW(TAG, "Transport switch detected. Restarting MQTT on %s",
+                         broker_uri != nullptr ? broker_uri : "null");
+                const esp_err_t switch_ret = mqtt_publisher.start(broker_uri, app_config::kMqttClientId);
+                if (switch_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "MQTT restart after transport switch failed: %s", esp_err_to_name(switch_ret));
+                    mqtt_retry_interval_ms = app_config::kMqttReconnectIntervalMs;
+                    next_mqtt_retry = now_ticks + pdMS_TO_TICKS(mqtt_retry_interval_ms);
+                } else {
+                    mqtt_retry_interval_ms = app_config::kMqttReconnectIntervalMs;
+                    next_mqtt_retry = now_ticks + pdMS_TO_TICKS(mqtt_retry_interval_ms);
+                }
+            } else if (app_config::kEnableVerboseTransportLogs) {
+                ESP_LOGI(TAG,
+                         "transport monitor connected=%d active=%d mqtt_connected=%d",
+                         connected_transport,
+                         static_cast<int>(active_transport),
+                         mqtt_publisher.isConnected());
+            }
+            last_transport_check = now_ticks;
+        }
+
+        if (app_config::kEnableRuntimeStatusLine &&
+            (now_ticks - last_status_log) >= pdMS_TO_TICKS(app_config::kRuntimeStatusIntervalMs)) {
+            ESP_LOGI(TAG,
+                     "status transport=%s transport_up=%d mqtt_up=%d broker=%s retry_ms=%lu",
+                     transportName(active_transport),
+                     connected_transport,
+                     mqtt_publisher.isConnected(),
+                     broker_uri != nullptr ? broker_uri : "null",
+                     static_cast<unsigned long>(mqtt_retry_interval_ms));
+            last_status_log = now_ticks;
+        }
+
+        if (mqtt_publisher.isConnected()) {
+            mqtt_retry_interval_ms = app_config::kMqttReconnectIntervalMs;
+            next_mqtt_retry = now_ticks + pdMS_TO_TICKS(mqtt_retry_interval_ms);
+        }
+
+        if (connected_transport && !mqtt_publisher.isConnected() && now_ticks >= next_mqtt_retry) {
+            broker_uri = brokerForTransport(active_transport);
+            if (app_config::kEnableVerboseTransportLogs) {
+                ESP_LOGI(TAG,
+                         "MQTT retry on transport=%d broker=%s interval_ms=%lu",
+                         static_cast<int>(active_transport),
+                         broker_uri != nullptr ? broker_uri : "null",
+                         static_cast<unsigned long>(mqtt_retry_interval_ms));
+            }
             const esp_err_t mqtt_retry_ret = mqtt_publisher.start(broker_uri, app_config::kMqttClientId);
             if (mqtt_retry_ret != ESP_OK) {
                 ESP_LOGW(TAG, "MQTT retry failed: %s", esp_err_to_name(mqtt_retry_ret));
+                const uint32_t doubled = mqtt_retry_interval_ms * 2;
+                mqtt_retry_interval_ms = (doubled > app_config::kMqttReconnectMaxIntervalMs)
+                                         ? app_config::kMqttReconnectMaxIntervalMs
+                                         : doubled;
+            } else {
+                mqtt_retry_interval_ms = app_config::kMqttReconnectIntervalMs;
             }
+            next_mqtt_retry = now_ticks + pdMS_TO_TICKS(mqtt_retry_interval_ms);
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));

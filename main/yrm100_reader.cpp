@@ -20,6 +20,14 @@ static constexpr bool kVerboseLogs = false;
 static constexpr uint32_t kInventoryPollIntervalMs = 120;
 static constexpr uint32_t kInventoryTxTimeoutMs = 300;
 static constexpr uint32_t kInventoryErrorBackoffMs = 500;
+static constexpr size_t kConfirmSlots = 24;
+
+#define YRM100_STATUS_LOG(...)                               \
+    do {                                                     \
+        if (app_config::kEnableYrm100StatusLogs) {          \
+            ESP_LOGI(TAG, __VA_ARGS__);                     \
+        }                                                    \
+    } while (0)
 
 void logBytes(const char *label, const std::vector<uint8_t> &bytes) {
     char buffer[256] = {0};
@@ -37,6 +45,60 @@ struct ProbeCommand {
     uint32_t wait_ms;
     bool expect_response;
 };
+
+struct ConfirmEntry {
+    bool used;
+    char epc[96];
+    uint32_t first_seen_ms;
+    uint32_t last_seen_ms;
+    uint8_t count;
+};
+
+ConfirmEntry s_confirm_entries[kConfirmSlots] = {};
+
+bool isConfirmedTag(const char *epc, uint32_t now_ms) {
+    if (epc == nullptr || epc[0] == '\0') {
+        return false;
+    }
+
+    size_t free_slot = kConfirmSlots;
+    for (size_t i = 0; i < kConfirmSlots; ++i) {
+        if (!s_confirm_entries[i].used) {
+            if (free_slot == kConfirmSlots) {
+                free_slot = i;
+            }
+            continue;
+        }
+
+        if (std::strncmp(s_confirm_entries[i].epc, epc, sizeof(s_confirm_entries[i].epc)) != 0) {
+            continue;
+        }
+
+        const uint32_t age_ms = now_ms - s_confirm_entries[i].first_seen_ms;
+        if (age_ms <= app_config::kYrm100ConfirmWindowMs) {
+            if (s_confirm_entries[i].count < 255) {
+                s_confirm_entries[i].count++;
+            }
+        } else {
+            s_confirm_entries[i].first_seen_ms = now_ms;
+            s_confirm_entries[i].count = 1;
+        }
+
+        s_confirm_entries[i].last_seen_ms = now_ms;
+        return s_confirm_entries[i].count >= app_config::kYrm100RequiredSightings;
+    }
+
+    if (free_slot == kConfirmSlots) {
+        free_slot = 0;
+    }
+
+    s_confirm_entries[free_slot].used = true;
+    std::snprintf(s_confirm_entries[free_slot].epc, sizeof(s_confirm_entries[free_slot].epc), "%s", epc);
+    s_confirm_entries[free_slot].first_seen_ms = now_ms;
+    s_confirm_entries[free_slot].last_seen_ms = now_ms;
+    s_confirm_entries[free_slot].count = 1;
+    return app_config::kYrm100RequiredSightings <= 1;
+}
 }
 
 MqttPublisher *Yrm100Reader::s_mqtt_publisher = nullptr;
@@ -87,6 +149,11 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
         return;
     }
 
+    // Accept both response(0x01) and notification(0x02) inventory frames.
+    if ((frame[1] != 0x01 && frame[1] != 0x02) || frame[2] != 0x22) {
+        return;
+    }
+
     ESP_LOGD(TAG, "inventory frame len=%zu", frame_len);
 
     const uint16_t data_len = (static_cast<uint16_t>(frame[3]) << 8) | frame[4];
@@ -94,13 +161,56 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
         return;
     }
 
+    const uint8_t *tag_data = frame + 5;
+    size_t epc_start = 0;
+    size_t epc_bytes = 0;
+    uint16_t pc = 0;
+    bool parsed_with_pc = false;
+
+    // Preferred format: PC(2) + EPC(N) + CRC16(2)
+    if (data_len >= 6) {
+        pc = (static_cast<uint16_t>(tag_data[0]) << 8) | tag_data[1];
+        const size_t candidate_epc_bytes = static_cast<size_t>(((pc >> 11) & 0x1F) * 2);
+        const size_t required_len = 2 + candidate_epc_bytes + 2;
+        if (candidate_epc_bytes >= 2 && candidate_epc_bytes <= 62 && data_len >= required_len) {
+            epc_start = 2;
+            epc_bytes = candidate_epc_bytes;
+            parsed_with_pc = true;
+        }
+    }
+
+    if (epc_bytes == 0) {
+        return;
+    }
+
+    if (epc_bytes < app_config::kYrm100MinEpcBytes) {
+        return;
+    }
+
     char epc_hex[96] = {0};
     size_t epc_offset = 0;
-    for (size_t k = 0; k < data_len && epc_offset < sizeof(epc_hex) - 3; ++k) {
-        epc_offset += std::snprintf(epc_hex + epc_offset, sizeof(epc_hex) - epc_offset, "%02X", frame[5 + k]);
+    for (size_t k = 0; k < epc_bytes && epc_offset < sizeof(epc_hex) - 3; ++k) {
+        epc_offset += std::snprintf(epc_hex + epc_offset, sizeof(epc_hex) - epc_offset, "%02X", tag_data[epc_start + k]);
     }
 
     if (epc_hex[0] == '\0') {
+        return;
+    }
+
+    // Basic EPC sanity: even number of hex chars and plausible bounds.
+    if ((epc_offset % 2) != 0 || epc_offset < 8 || epc_offset > 64) {
+        return;
+    }
+
+    // Reject degenerate all-00 or all-FF payloads.
+    bool all_zero = true;
+    bool all_ff = true;
+    for (size_t k = 0; k < epc_bytes; ++k) {
+        const uint8_t b = tag_data[epc_start + k];
+        all_zero = all_zero && (b == 0x00);
+        all_ff = all_ff && (b == 0xFF);
+    }
+    if (all_zero || all_ff) {
         return;
     }
 
@@ -111,6 +221,10 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
     }
 
     const uint32_t now_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (!isConfirmedTag(normalized_epc, now_ms)) {
+        return;
+    }
+
     RfidEvent event = {};
     std::snprintf(event.rfid_id, sizeof(event.rfid_id), "%s", normalized_epc);
     std::snprintf(event.reader_id, sizeof(event.reader_id), "yrm100");
@@ -127,7 +241,9 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
                      static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
     }
 
-    ESP_LOGI(TAG, "read_event epc=%s raw_epc=%s time=%s", normalized_epc, epc_hex, time_buf);
+    if (parsed_with_pc) {
+        YRM100_STATUS_LOG("read_event epc=%s pc=0x%04X time=%s", normalized_epc, pc, time_buf);
+    }
     if (s_mqtt_publisher != nullptr) {
         if (s_mqtt_publisher->isConnected()) {
             const bool published = s_mqtt_publisher->publishTag(normalized_epc, time_buf);
@@ -135,7 +251,7 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
                 ESP_LOGW(TAG, "MQTT publish failed for EPC %s", normalized_epc);
             }
         } else {
-            ESP_LOGI(TAG, "MQTT not connected yet; logged reader event for EPC %s", normalized_epc);
+            YRM100_STATUS_LOG("MQTT not connected yet; logged reader event for EPC %s", normalized_epc);
         }
     }
 }
@@ -181,7 +297,7 @@ void Yrm100Reader::processReaderStream(ReaderRxState *state) {
         state->last_type = msg_type;
         state->last_cmd = cmd;
 
-        ESP_LOGI(TAG, "valid frame type=0x%02X cmd=0x%02X data_len=%u", msg_type, cmd, data_len);
+        YRM100_STATUS_LOG("valid frame type=0x%02X cmd=0x%02X data_len=%u", msg_type, cmd, data_len);
         if ((msg_type == 0x01 || msg_type == 0x02) && cmd == 0x22 && data_len > 0) {
             std::vector<uint8_t> payload(frame + 5, frame + 5 + data_len);
             logBytes("payload", payload);
@@ -375,7 +491,7 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
         ESP_LOGW(TAG, "No response bytes received from reader across the tested baud rates");
     }
 
-    ESP_LOGI(TAG, "Waiting for reader frames on USB");
+    YRM100_STATUS_LOG("Waiting for reader frames on USB");
     while (true) {
         const esp_err_t inventory_err = sendReaderFrame(dev, "Inventory", buildInventoryFrame(), kInventoryTxTimeoutMs);
         if (inventory_err != ESP_OK) {
@@ -396,7 +512,7 @@ void Yrm100Reader::timeUpdateTask(void *pvParameters) {
                                  : (s_cached_time_src == TimeSource::kNtp) ? "NTP"
                                  : (s_cached_time_src == TimeSource::kGsm) ? "GSM"
                                  : "fallback";
-            ESP_LOGI(TAG, "time=%s [%s]", s_cached_time, src_name);
+            YRM100_STATUS_LOG("time=%s [%s]", s_cached_time, src_name);
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
@@ -429,7 +545,7 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
     }
 
     if (!app_config::kEnableRfidReader) {
-        ESP_LOGI(TAG, "RFID reader and VCP client disabled");
+        YRM100_STATUS_LOG("RFID reader and VCP client disabled");
         xTaskCreatePinnedToCore(usbLibDaemonTask, "usb_daemon", 4096, nullptr, 10, nullptr, 0);
         xTaskCreatePinnedToCore(timeUpdateTask, "time_update", 4096, nullptr, 2, nullptr, 0);
         return ESP_OK;

@@ -14,6 +14,7 @@ enum class TransportType {
 class TransportManager {
 public:
     bool connectAny();
+    bool refreshActiveTransport();
     TransportType activeTransport() const;
 
 private:
@@ -28,7 +29,6 @@ private:
     TransportType active_transport_ = TransportType::kNone;
     bool wifi_enabled_ = true;
     bool ethernet_enabled_ = true;
-    bool gprs_enabled_ = false;
     bool wifi_initialized_ = false;
     bool wifi_connected_ = false;
     bool ethernet_initialized_ = false;
