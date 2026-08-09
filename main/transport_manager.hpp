@@ -3,6 +3,7 @@
 #include "esp_eth.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_modem_api.h"
 
 enum class TransportType {
     kNone,
@@ -37,6 +38,9 @@ private:
     TransportType gprs_gate_reason_ = TransportType::kNone;
     bool gprs_initialized_ = false;
     bool gprs_ready_ = false;
+    bool gprs_attempted_ = false;
+    esp_netif_t *gprs_netif_ = nullptr;
+    esp_modem_dce_t *gprs_dce_ = nullptr;
     esp_netif_t *wifi_netif_ = nullptr;
     esp_eth_handle_t ethernet_handle_ = nullptr;
     esp_netif_t *ethernet_netif_ = nullptr;

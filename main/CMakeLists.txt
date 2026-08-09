@@ -24,6 +24,7 @@ idf_component_register(
         app_update
         mqtt
         lwip
+        esp_modem
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -fexceptions)
