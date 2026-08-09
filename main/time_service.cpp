@@ -5,33 +5,27 @@
 #include <cstring>
 #include <ctime>
 #include <cctype>
+#include <cstdint>
 
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sys/time.h"
 
 namespace {
 static const char *TAG = "time_service";
 static constexpr int kUartRxBufferSize = 2048;
 static constexpr int kUartTxBufferSize = 512;
 
-// Converts UTC h/m/s to local time using the active TZ (requires system clock to be set).
-static void utcToLocal(int &hour, int &minute, int &second) {
-    const std::time_t now = std::time(nullptr);
-    const std::tm *utc_ptr = std::gmtime(&now);
-    if (utc_ptr == nullptr) return;
-    const std::tm utc = *utc_ptr;
-    const std::tm *loc = std::localtime(&now);
-    if (loc == nullptr) return;
-    int offset_sec = (loc->tm_hour - utc.tm_hour) * 3600
-                   + (loc->tm_min  - utc.tm_min)  * 60;
-    int total = hour * 3600 + minute * 60 + second + offset_sec;
-    total = ((total % 86400) + 86400) % 86400;
-    hour   = total / 3600;
-    minute = (total % 3600) / 60;
-    second = total % 60;
+static int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned doy = (153U * (month + (month > 2 ? -3U : 9U)) + 2U) / 5U + day - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
 }
 }
 
@@ -76,6 +70,31 @@ TimeService::TimeService() {
     ESP_LOGI(TAG, "Timezone set to %s", app_config::kTimezone);
 }
 
+bool TimeService::applyUtcClock(int year, int month, int day, int hour, int minute, int second) const {
+    if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) {
+        return false;
+    }
+
+    const int64_t days = daysFromCivil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
+    const int64_t epoch = days * 86400LL + static_cast<int64_t>(hour) * 3600LL + static_cast<int64_t>(minute) * 60LL + second;
+    if (epoch < 0) {
+        return false;
+    }
+
+    const timeval tv = {
+        .tv_sec = static_cast<time_t>(epoch),
+        .tv_usec = 0,
+    };
+    if (settimeofday(&tv, nullptr) != 0) {
+        ESP_LOGW(TAG, "settimeofday failed");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "System clock set to %04d-%02d-%02d %02d:%02d:%02d UTC", year, month, day, hour, minute, second);
+    return true;
+}
+
 void TimeService::initNtp() {
     if (ntp_initialized_) {
         return;
@@ -97,21 +116,31 @@ TimeSource TimeService::getCurrentTimeHHMMSS(char *out, size_t out_size) const {
     int minute = 0;
     int second = 0;
 
-    if (tryGetGpsTime(hour, minute, second)) {
-        utcToLocal(hour, minute, second);
-        std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
-        return TimeSource::kGps;
-    }
-
     if (tryGetNtpTime(hour, minute, second)) {
         std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
         return TimeSource::kNtp;
     }
 
     if (tryGetGsmNetworkTime(hour, minute, second)) {
-        utcToLocal(hour, minute, second);
-        std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
+        const std::time_t now = std::time(nullptr);
+        const std::tm *tm_now = std::localtime(&now);
+        if (tm_now != nullptr) {
+            std::snprintf(out, out_size, "%02d:%02d:%02d", tm_now->tm_hour, tm_now->tm_min, tm_now->tm_sec);
+        } else {
+            std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
+        }
         return TimeSource::kGsm;
+    }
+
+    if (tryGetGpsTime(hour, minute, second)) {
+        const std::time_t now = std::time(nullptr);
+        const std::tm *tm_now = std::localtime(&now);
+        if (tm_now != nullptr) {
+            std::snprintf(out, out_size, "%02d:%02d:%02d", tm_now->tm_hour, tm_now->tm_min, tm_now->tm_sec);
+        } else {
+            std::snprintf(out, out_size, "%02d:%02d:%02d", hour, minute, second);
+        }
+        return TimeSource::kGps;
     }
 
     const std::time_t now = std::time(nullptr);
@@ -172,20 +201,31 @@ bool TimeService::queryAtLine(const char *command, char *line_out, size_t line_o
     return false;
 }
 
-bool TimeService::parseGsmClock(const char *line, int &hour, int &minute, int &second) const {
+bool TimeService::parseGsmClock(const char *line,
+                                int &year,
+                                int &month,
+                                int &day,
+                                int &hour,
+                                int &minute,
+                                int &second,
+                                int &utc_offset_quarters) const {
     if (line == nullptr) {
         return false;
     }
 
     int yy = 0;
-    int mon = 0;
-    int day = 0;
     int tz = 0;
-    int matched = std::sscanf(line, "+CCLK: \"%2d/%2d/%2d,%2d:%2d:%2d%2d\"", &yy, &mon, &day, &hour, &minute, &second, &tz);
-    return matched >= 6;
+    int matched = std::sscanf(line, "+CCLK: \"%2d/%2d/%2d,%2d:%2d:%2d%2d\"", &yy, &month, &day, &hour, &minute, &second, &tz);
+    if (matched < 6) {
+        return false;
+    }
+
+    year = 2000 + yy;
+    utc_offset_quarters = tz;
+    return true;
 }
 
-bool TimeService::parseGnsUtc(const char *line, int &hour, int &minute, int &second) const {
+bool TimeService::parseGnsUtc(const char *line, int &year, int &month, int &day, int &hour, int &minute, int &second) const {
     if (line == nullptr) {
         return false;
     }
@@ -201,7 +241,15 @@ bool TimeService::parseGnsUtc(const char *line, int &hour, int &minute, int &sec
         return false;
     }
 
-    if (!std::isdigit(static_cast<unsigned char>(utc[8])) ||
+    if (!std::isdigit(static_cast<unsigned char>(utc[0])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[1])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[2])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[3])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[4])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[5])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[6])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[7])) ||
+        !std::isdigit(static_cast<unsigned char>(utc[8])) ||
         !std::isdigit(static_cast<unsigned char>(utc[9])) ||
         !std::isdigit(static_cast<unsigned char>(utc[10])) ||
         !std::isdigit(static_cast<unsigned char>(utc[11])) ||
@@ -210,6 +258,9 @@ bool TimeService::parseGnsUtc(const char *line, int &hour, int &minute, int &sec
         return false;
     }
 
+    year = (utc[0] - '0') * 1000 + (utc[1] - '0') * 100 + (utc[2] - '0') * 10 + (utc[3] - '0');
+    month = (utc[4] - '0') * 10 + (utc[5] - '0');
+    day = (utc[6] - '0') * 10 + (utc[7] - '0');
     hour = (utc[8] - '0') * 10 + (utc[9] - '0');
     minute = (utc[10] - '0') * 10 + (utc[11] - '0');
     second = (utc[12] - '0') * 10 + (utc[13] - '0');
@@ -262,7 +313,18 @@ bool TimeService::tryGetGpsTime(int &hour, int &minute, int &second) const {
         return false;
     }
 
-    return parseGnsUtc(line, hour, minute, second);
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (!parseGnsUtc(line, year, month, day, hour, minute, second)) {
+        return false;
+    }
+
+    if (!applyUtcClock(year, month, day, hour, minute, second)) {
+        return false;
+    }
+
+    return true;
 }
 
 bool TimeService::tryGetGsmNetworkTime(int &hour, int &minute, int &second) const {
@@ -279,5 +341,42 @@ bool TimeService::tryGetGsmNetworkTime(int &hour, int &minute, int &second) cons
         return false;
     }
 
-    return parseGsmClock(line, hour, minute, second);
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int utc_offset_quarters = 0;
+    if (!parseGsmClock(line, year, month, day, hour, minute, second, utc_offset_quarters)) {
+        return false;
+    }
+
+    const int offset_seconds = utc_offset_quarters * 15 * 60;
+    int64_t epoch = daysFromCivil(year, static_cast<unsigned>(month), static_cast<unsigned>(day)) * 86400LL
+                  + static_cast<int64_t>(hour) * 3600LL
+                  + static_cast<int64_t>(minute) * 60LL
+                  + second;
+    epoch -= offset_seconds;
+    if (epoch < 0) {
+        return false;
+    }
+
+    const int utc_year = 1970; // placeholder for logging below
+    (void)utc_year;
+
+    const int utc_hour = static_cast<int>((epoch % 86400LL) / 3600LL);
+    const int utc_minute = static_cast<int>((epoch % 3600LL) / 60LL);
+    const int utc_second = static_cast<int>(epoch % 60LL);
+
+    // Reconstruct UTC date from epoch for settimeofday.
+    // Convert using localtime on a UTC TZ-less representation by setting the clock directly.
+    const timeval tv = {
+        .tv_sec = static_cast<time_t>(epoch),
+        .tv_usec = 0,
+    };
+    if (settimeofday(&tv, nullptr) != 0) {
+        ESP_LOGW(TAG, "settimeofday failed for GSM time");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "System clock set from GSM time %04d-%02d-%02d %02d:%02d:%02d UTC", year, month, day, utc_hour, utc_minute, utc_second);
+    return true;
 }

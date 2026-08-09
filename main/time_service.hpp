@@ -19,9 +19,10 @@ public:
     TimeSource getCurrentTimeHHMMSS(char *out, size_t out_size) const;
 
 private:
+    bool applyUtcClock(int year, int month, int day, int hour, int minute, int second) const;
     bool queryAtLine(const char *command, char *line_out, size_t line_out_size, uint32_t timeout_ms) const;
-    bool parseGsmClock(const char *line, int &hour, int &minute, int &second) const;
-    bool parseGnsUtc(const char *line, int &hour, int &minute, int &second) const;
+    bool parseGsmClock(const char *line, int &year, int &month, int &day, int &hour, int &minute, int &second, int &utc_offset_quarters) const;
+    bool parseGnsUtc(const char *line, int &year, int &month, int &day, int &hour, int &minute, int &second) const;
     bool tryGetGpsTime(int &hour, int &minute, int &second) const;
     bool tryGetNtpTime(int &hour, int &minute, int &second) const;
     bool tryGetGsmNetworkTime(int &hour, int &minute, int &second) const;
