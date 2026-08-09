@@ -21,6 +21,7 @@ static constexpr uint32_t kInventoryPollIntervalMs = 120;
 static constexpr uint32_t kInventoryTxTimeoutMs = 300;
 static constexpr uint32_t kInventoryErrorBackoffMs = 500;
 static constexpr size_t kConfirmSlots = 24;
+static constexpr uint16_t kReadMultiLoopCount = 0xFFFF;
 
 #define YRM100_STATUS_LOG(...)                               \
     do {                                                     \
@@ -56,21 +57,6 @@ struct ConfirmEntry {
 
 ConfirmEntry s_confirm_entries[kConfirmSlots] = {};
 
-uint16_t crc16CcittFalse(const uint8_t *data, size_t len) {
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= static_cast<uint16_t>(data[i]) << 8;
-        for (int bit = 0; bit < 8; ++bit) {
-            if ((crc & 0x8000U) != 0U) {
-                crc = static_cast<uint16_t>((crc << 1) ^ 0x1021U);
-            } else {
-                crc = static_cast<uint16_t>(crc << 1);
-            }
-        }
-    }
-    return crc;
-}
-
 bool extractEpcWindow(const uint8_t *tag_data,
                       size_t data_len,
                       size_t &epc_start,
@@ -80,44 +66,16 @@ bool extractEpcWindow(const uint8_t *tag_data,
         return false;
     }
 
-    // Different firmware revisions prepend extra fields (RSSI/antenna).
-    // Scan for a valid PC+EPC+CRC layout within the payload, then verify CRC
-    // to avoid treating random bytes as EPC (ghost tags).
-    for (size_t offset = 0; (offset + 6) <= data_len; ++offset) {
-        const uint16_t candidate_pc =
-            (static_cast<uint16_t>(tag_data[offset]) << 8) | tag_data[offset + 1];
-        const size_t candidate_epc_bytes =
-            static_cast<size_t>(((candidate_pc >> 11) & 0x1F) * 2);
-        if (candidate_epc_bytes < 2 || candidate_epc_bytes > 62) {
-            continue;
-        }
-
-        const size_t required_end = offset + 2 + candidate_epc_bytes + 2;
-        if (required_end > data_len) {
-            continue;
-        }
-
-        // EPC Gen2 CRC is over PC+EPC. Accept both endian representations,
-        // as modules may report CRC byte order differently.
-        const uint16_t computed_crc =
-            crc16CcittFalse(tag_data + offset, 2 + candidate_epc_bytes);
-        const uint16_t rx_crc_be =
-            (static_cast<uint16_t>(tag_data[offset + 2 + candidate_epc_bytes]) << 8) |
-            tag_data[offset + 2 + candidate_epc_bytes + 1];
-        const uint16_t rx_crc_le =
-            (static_cast<uint16_t>(tag_data[offset + 2 + candidate_epc_bytes + 1]) << 8) |
-            tag_data[offset + 2 + candidate_epc_bytes];
-        if (computed_crc != rx_crc_be && computed_crc != rx_crc_le) {
-            continue;
-        }
-
-        epc_start = offset + 2;
-        epc_bytes = candidate_epc_bytes;
-        pc = candidate_pc;
-        return true;
+    // The reader's notification frames observed on the wire are 17 bytes:
+    // RSSI(1) + PC(2) + EPC(12) + CRC(2). The real tag ID is the 12-byte EPC.
+    if (data_len != 17) {
+        return false;
     }
 
-    return false;
+    epc_start = 3;
+    epc_bytes = 12;
+    pc = (static_cast<uint16_t>(tag_data[1]) << 8) | tag_data[2];
+    return true;
 }
 
 bool isConfirmedTag(const char *epc, uint32_t now_ms) {
@@ -208,6 +166,14 @@ std::vector<uint8_t> Yrm100Reader::buildStopMultiFrame() {
     return buildYrm100Frame(0x00, 0x28, {});
 }
 
+static std::vector<uint8_t> buildReadMultiFrame(uint16_t loop_count) {
+    const uint8_t hi = static_cast<uint8_t>((loop_count >> 8) & 0xFF);
+    const uint8_t lo = static_cast<uint8_t>(loop_count & 0xFF);
+    // BB 00 27 00 03 22 [loop_hi] [loop_lo] [checksum] 7E
+    const uint8_t checksum = static_cast<uint8_t>((0x00 + 0x27 + 0x00 + 0x03 + 0x22 + hi + lo) & 0xFF);
+    return {0xBB, 0x00, 0x27, 0x00, 0x03, 0x22, hi, lo, checksum, 0x7E};
+}
+
 void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_len) {
     if (frame == nullptr || frame_len < 7 || s_mqtt_publisher == nullptr) {
         return;
@@ -229,13 +195,9 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
     size_t epc_start = 0;
     size_t epc_bytes = 0;
     uint16_t pc = 0;
-    const bool parsed_with_pc = extractEpcWindow(tag_data, data_len, epc_start, epc_bytes, pc);
+    (void)extractEpcWindow(tag_data, data_len, epc_start, epc_bytes, pc);
 
-    if (epc_bytes == 0) {
-        return;
-    }
-
-    if (epc_bytes < app_config::kYrm100MinEpcBytes) {
+    if (epc_bytes != 12) {
         return;
     }
 
@@ -249,8 +211,8 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
         return;
     }
 
-    // Basic EPC sanity: even number of hex chars and plausible bounds.
-    if ((epc_offset % 2) != 0 || epc_offset < 8 || epc_offset > 64) {
+    // Basic EPC sanity: exact 12-byte EPC => 24 hex chars.
+    if (epc_offset != 24) {
         return;
     }
 
@@ -266,11 +228,7 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
         return;
     }
 
-    const size_t epc_len = std::strlen(epc_hex);
     const char *normalized_epc = epc_hex;
-    if (epc_len > app_config::kYrm100TagTrailingHexDigits) {
-        normalized_epc = epc_hex + (epc_len - app_config::kYrm100TagTrailingHexDigits);
-    }
 
     const uint32_t now_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (!isConfirmedTag(normalized_epc, now_ms)) {
@@ -293,9 +251,6 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
                      static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
     }
 
-    if (parsed_with_pc) {
-        YRM100_STATUS_LOG("read_event epc=%s pc=0x%04X time=%s", normalized_epc, pc, time_buf);
-    }
     if (s_mqtt_publisher != nullptr) {
         ESP_LOGI(TAG,
                  "Tag detected EPC=%s time=%s mqtt_connected=%d",
@@ -548,15 +503,30 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
         ESP_LOGW(TAG, "No response bytes received from reader across the tested baud rates");
     }
 
-    YRM100_STATUS_LOG("Waiting for reader frames on USB");
-    while (true) {
-        const esp_err_t inventory_err = sendReaderFrame(dev, "Inventory", buildInventoryFrame(), kInventoryTxTimeoutMs);
-        if (inventory_err != ESP_OK) {
-            ESP_LOGW(TAG, "Inventory command failed: %s", esp_err_to_name(inventory_err));
-            vTaskDelay(pdMS_TO_TICKS(kInventoryErrorBackoffMs));
-            continue;
+    // Align with vendor demo behavior: start multi-read once and parse async
+    // inventory notifications, instead of spamming single-inventory commands.
+    const esp_err_t read_multi_err =
+        sendReaderFrame(dev, "ReadMulti", buildReadMultiFrame(kReadMultiLoopCount), 2000);
+    if (read_multi_err != ESP_OK) {
+        ESP_LOGW(TAG, "ReadMulti command failed: %s; fallback to single inventory polling",
+                 esp_err_to_name(read_multi_err));
+
+        YRM100_STATUS_LOG("Waiting for reader frames on USB (single inventory mode)");
+        while (true) {
+            const esp_err_t inventory_err =
+                sendReaderFrame(dev, "Inventory", buildInventoryFrame(), kInventoryTxTimeoutMs);
+            if (inventory_err != ESP_OK) {
+                ESP_LOGW(TAG, "Inventory command failed: %s", esp_err_to_name(inventory_err));
+                vTaskDelay(pdMS_TO_TICKS(kInventoryErrorBackoffMs));
+                continue;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kInventoryPollIntervalMs));
         }
-        vTaskDelay(pdMS_TO_TICKS(kInventoryPollIntervalMs));
+    }
+
+    YRM100_STATUS_LOG("Waiting for reader frames on USB (multi inventory mode)");
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 

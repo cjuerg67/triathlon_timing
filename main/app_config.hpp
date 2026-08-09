@@ -14,7 +14,6 @@ static constexpr const char *kMqttTopicStarter = "triathlon/starter";
 static constexpr const char *kMqttClientId = "triathlon-timer";
 static constexpr uint32_t kGpsPublishIntervalMs = 30000;
 static constexpr uint32_t kRfidDuplicateDebounceMs = 2000;    
-static constexpr size_t kYrm100TagTrailingHexDigits = 20;
 static constexpr uint32_t kYrm100MinEpcBytes = 8;
 static constexpr uint32_t kYrm100ConfirmWindowMs = 700;
 static constexpr uint32_t kYrm100RequiredSightings = 2;

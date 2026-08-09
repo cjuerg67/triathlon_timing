@@ -131,28 +131,22 @@ void StatusLcd::update(TimeService &time_service,
                   transport_up ? '+' : '-',
                   mqtt_up ? 'M' : 'm');
 
-    char tag_view[13] = {0};
+    char tag_view[17] = {0};
     const char *tag = (latest_tag != nullptr) ? latest_tag : "";
     const size_t tag_len = std::strlen(tag);
     if (tag_len == 0) {
         std::snprintf(tag_view, sizeof(tag_view), "----");
-        scroll_offset_ = 0;
-    } else if (tag_len <= sizeof(tag_view) - 1) {
-        std::snprintf(tag_view, sizeof(tag_view), "%s", tag);
-        scroll_offset_ = 0;
     } else {
         const size_t visible = sizeof(tag_view) - 1;
-        const size_t max_offset = tag_len - visible;
-        if (scroll_offset_ > max_offset) {
-            scroll_offset_ = 0;
+        const char *start = tag;
+        if (tag_len > visible) {
+            start = tag + (tag_len - visible);
         }
-        std::memcpy(tag_view, tag + scroll_offset_, visible);
-        tag_view[visible] = '\0';
-        scroll_offset_++;
+        std::snprintf(tag_view, sizeof(tag_view), "%s", start);
     }
 
     char line2[17] = {0};
-    std::snprintf(line2, sizeof(line2), "TAG:%s", tag_view);
+    std::snprintf(line2, sizeof(line2), "%s", tag_view);
 
     renderLine(0, line1);
     renderLine(1, line2);
