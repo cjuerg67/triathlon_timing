@@ -64,10 +64,25 @@ bool MqttPublisher::isConnected() const {
     return connected_;
 }
 
+void MqttPublisher::getLastTag(char *out, size_t out_size) const {
+    if (out == nullptr || out_size == 0) {
+        return;
+    }
+
+    taskENTER_CRITICAL(&state_lock_);
+    std::snprintf(out, out_size, "%s", last_tag_);
+    taskEXIT_CRITICAL(&state_lock_);
+}
+
 bool MqttPublisher::publishTag(const char *rfid_id, const char *hhmmss) {
     if (client_ == nullptr || rfid_id == nullptr || hhmmss == nullptr) {
         return false;
     }
+
+    taskENTER_CRITICAL(&state_lock_);
+    std::snprintf(last_tag_, sizeof(last_tag_), "%s", rfid_id);
+    std::snprintf(last_tag_time_, sizeof(last_tag_time_), "%s", hhmmss);
+    taskEXIT_CRITICAL(&state_lock_);
 
     if (s_publish_dedup_mutex == nullptr) {
         s_publish_dedup_mutex = xSemaphoreCreateMutex();

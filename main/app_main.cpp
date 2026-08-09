@@ -10,6 +10,7 @@
 #include "rfid_event.hpp"
 #include "time_service.hpp"
 #include "transport_manager.hpp"
+#include "status_lcd.hpp"
 #include "cf_e714_reader.hpp"
 #include "keyboard_reader.hpp"
 #include "yrm100_reader.hpp"
@@ -46,9 +47,17 @@ extern "C" void app_main(void) {
     static TransportManager transport_manager;
     static MqttPublisher mqtt_publisher;
     static TimeService time_service;
+    static StatusLcd status_lcd;
     static Yrm100Reader yrm100_reader;
     static CfE714Reader cf_e714_reader;
     static KeyboardReader keyboard_reader;
+
+    if (app_config::kEnableStatusLcd) {
+        const esp_err_t lcd_init_ret = status_lcd.init();
+        if (lcd_init_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Status LCD init failed: %s", esp_err_to_name(lcd_init_ret));
+        }
+    }
 
     bool connected_transport = transport_manager.connectAny();
     TransportType active_transport = transport_manager.activeTransport();
@@ -81,6 +90,7 @@ extern "C" void app_main(void) {
     int loop_count = 0;
     TickType_t last_transport_check = 0;
     TickType_t last_status_log = 0;
+    TickType_t last_lcd_update = 0;
     TickType_t next_mqtt_retry = 0;
     uint32_t mqtt_retry_interval_ms = app_config::kMqttReconnectIntervalMs;
     while (true) {
@@ -153,6 +163,18 @@ extern "C" void app_main(void) {
                 mqtt_retry_interval_ms = app_config::kMqttReconnectIntervalMs;
             }
             next_mqtt_retry = now_ticks + pdMS_TO_TICKS(mqtt_retry_interval_ms);
+        }
+
+        if (app_config::kEnableStatusLcd &&
+            (now_ticks - last_lcd_update) >= pdMS_TO_TICKS(app_config::kStatusLcdUpdateIntervalMs)) {
+            char last_tag[64] = {0};
+            mqtt_publisher.getLastTag(last_tag, sizeof(last_tag));
+            status_lcd.update(time_service,
+                              active_transport,
+                              connected_transport,
+                              mqtt_publisher.isConnected(),
+                              last_tag);
+            last_lcd_update = now_ticks;
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));

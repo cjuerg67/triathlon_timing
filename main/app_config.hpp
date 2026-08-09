@@ -24,7 +24,9 @@ static constexpr bool kEnableGprsTransport = true;
 static constexpr bool kEnableVerboseTransportLogs = false;
 static constexpr bool kEnableYrm100StatusLogs = false;
 static constexpr bool kEnableRuntimeStatusLine = true;
+static constexpr bool kEnableStatusLcd = true;
 static constexpr uint32_t kRuntimeStatusIntervalMs = 5000;
+static constexpr uint32_t kStatusLcdUpdateIntervalMs = 500;
 static constexpr uint32_t kTransportRefreshIntervalMs = 3000;
 static constexpr uint32_t kMqttReconnectIntervalMs = 5000;
 static constexpr uint32_t kMqttReconnectMaxIntervalMs = 30000;
@@ -36,6 +38,13 @@ static constexpr uint32_t kWifiConnectTimeoutMs = 10000;
 static constexpr int kC6UartPort = 0;
 static constexpr int kC6UartTxPin = 5;
 static constexpr int kC6UartRxPin = 4;
+
+// Single HD44780 16x2 with PCF8574 backpack (typical address 0x27).
+static constexpr int kStatusLcdI2cPort = 0;
+static constexpr int kStatusLcdSdaPin = 7;
+static constexpr int kStatusLcdSclPin = 8;
+static constexpr uint8_t kStatusLcdAddress = 0x27;
+static constexpr uint32_t kStatusLcdI2cFrequencyHz = 100000;
 
 static constexpr int kSim7000UartPort = 2;
 static constexpr int kSim7000UartTxPin = 23;

@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 #include "mqtt_client.h"
 #include "time_service.hpp"
 
@@ -13,6 +14,7 @@ public:
     bool publishTag(const char *rfid_id, const char *hhmmss);
     bool publishStarterNumber(const char *number, const char *hhmmss);
     bool publishGpsStatus(const char *hhmmss, TimeSource source);
+    void getLastTag(char *out, size_t out_size) const;
 
 private:
     static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
@@ -20,4 +22,7 @@ private:
     esp_mqtt_client_handle_t client_ = nullptr;
     bool connected_ = false;
     char broker_uri_[96] = {0};
+    char last_tag_[64] = {0};
+    char last_tag_time_[16] = {0};
+    mutable portMUX_TYPE state_lock_ = portMUX_INITIALIZER_UNLOCKED;
 };

@@ -56,6 +56,70 @@ struct ConfirmEntry {
 
 ConfirmEntry s_confirm_entries[kConfirmSlots] = {};
 
+uint16_t crc16CcittFalse(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= static_cast<uint16_t>(data[i]) << 8;
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((crc & 0x8000U) != 0U) {
+                crc = static_cast<uint16_t>((crc << 1) ^ 0x1021U);
+            } else {
+                crc = static_cast<uint16_t>(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
+bool extractEpcWindow(const uint8_t *tag_data,
+                      size_t data_len,
+                      size_t &epc_start,
+                      size_t &epc_bytes,
+                      uint16_t &pc) {
+    if (tag_data == nullptr || data_len < 6) {
+        return false;
+    }
+
+    // Different firmware revisions prepend extra fields (RSSI/antenna).
+    // Scan for a valid PC+EPC+CRC layout within the payload, then verify CRC
+    // to avoid treating random bytes as EPC (ghost tags).
+    for (size_t offset = 0; (offset + 6) <= data_len; ++offset) {
+        const uint16_t candidate_pc =
+            (static_cast<uint16_t>(tag_data[offset]) << 8) | tag_data[offset + 1];
+        const size_t candidate_epc_bytes =
+            static_cast<size_t>(((candidate_pc >> 11) & 0x1F) * 2);
+        if (candidate_epc_bytes < 2 || candidate_epc_bytes > 62) {
+            continue;
+        }
+
+        const size_t required_end = offset + 2 + candidate_epc_bytes + 2;
+        if (required_end > data_len) {
+            continue;
+        }
+
+        // EPC Gen2 CRC is over PC+EPC. Accept both endian representations,
+        // as modules may report CRC byte order differently.
+        const uint16_t computed_crc =
+            crc16CcittFalse(tag_data + offset, 2 + candidate_epc_bytes);
+        const uint16_t rx_crc_be =
+            (static_cast<uint16_t>(tag_data[offset + 2 + candidate_epc_bytes]) << 8) |
+            tag_data[offset + 2 + candidate_epc_bytes + 1];
+        const uint16_t rx_crc_le =
+            (static_cast<uint16_t>(tag_data[offset + 2 + candidate_epc_bytes + 1]) << 8) |
+            tag_data[offset + 2 + candidate_epc_bytes];
+        if (computed_crc != rx_crc_be && computed_crc != rx_crc_le) {
+            continue;
+        }
+
+        epc_start = offset + 2;
+        epc_bytes = candidate_epc_bytes;
+        pc = candidate_pc;
+        return true;
+    }
+
+    return false;
+}
+
 bool isConfirmedTag(const char *epc, uint32_t now_ms) {
     if (epc == nullptr || epc[0] == '\0') {
         return false;
@@ -165,19 +229,7 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
     size_t epc_start = 0;
     size_t epc_bytes = 0;
     uint16_t pc = 0;
-    bool parsed_with_pc = false;
-
-    // Preferred format: PC(2) + EPC(N) + CRC16(2)
-    if (data_len >= 6) {
-        pc = (static_cast<uint16_t>(tag_data[0]) << 8) | tag_data[1];
-        const size_t candidate_epc_bytes = static_cast<size_t>(((pc >> 11) & 0x1F) * 2);
-        const size_t required_len = 2 + candidate_epc_bytes + 2;
-        if (candidate_epc_bytes >= 2 && candidate_epc_bytes <= 62 && data_len >= required_len) {
-            epc_start = 2;
-            epc_bytes = candidate_epc_bytes;
-            parsed_with_pc = true;
-        }
-    }
+    const bool parsed_with_pc = extractEpcWindow(tag_data, data_len, epc_start, epc_bytes, pc);
 
     if (epc_bytes == 0) {
         return;
@@ -245,6 +297,11 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
         YRM100_STATUS_LOG("read_event epc=%s pc=0x%04X time=%s", normalized_epc, pc, time_buf);
     }
     if (s_mqtt_publisher != nullptr) {
+        ESP_LOGI(TAG,
+                 "Tag detected EPC=%s time=%s mqtt_connected=%d",
+                 normalized_epc,
+                 time_buf,
+                 s_mqtt_publisher->isConnected());
         if (s_mqtt_publisher->isConnected()) {
             const bool published = s_mqtt_publisher->publishTag(normalized_epc, time_buf);
             if (!published) {

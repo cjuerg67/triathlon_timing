@@ -5,6 +5,7 @@ idf_component_register(
         "keyboard_reader.cpp"
         "mqtt_publisher.cpp"
         "rfid_deduplicator.cpp"
+        "status_lcd.cpp"
         "time_service.cpp"
         "transport_manager.cpp"
         "yrm100_reader.cpp"
@@ -17,6 +18,7 @@ idf_component_register(
         nvs_flash
         usb
         esp_driver_gpio
+        esp_driver_i2c
         esp_driver_uart
         esp_http_client
         app_update
