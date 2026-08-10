@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -75,6 +76,21 @@ bool extractEpcWindow(const uint8_t *tag_data,
     epc_start = 3;
     epc_bytes = 12;
     pc = (static_cast<uint16_t>(tag_data[1]) << 8) | tag_data[2];
+    return true;
+}
+
+bool getSystemTimeHhMmSs(char *out, size_t out_size) {
+    if (out == nullptr || out_size < 9) {
+        return false;
+    }
+
+    const std::time_t now = std::time(nullptr);
+    std::tm tm_now = {};
+    if (now <= 0 || localtime_r(&now, &tm_now) == nullptr || (tm_now.tm_year + 1900) < 2024) {
+        return false;
+    }
+
+    std::snprintf(out, out_size, "%02d:%02d:%02d", tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
     return true;
 }
 
@@ -246,7 +262,7 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
     char time_buf[16] = {0};
     // use pre-resolved cache; calling time service here blocks the USB callback
     std::snprintf(time_buf, sizeof(time_buf), "%s", s_cached_time);
-    if (s_cached_time_src == TimeSource::kFallback) {
+    if (s_cached_time_src == TimeSource::kFallback && !getSystemTimeHhMmSs(time_buf, sizeof(time_buf))) {
         std::snprintf(time_buf, sizeof(time_buf), "%lu",
                      static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
     }

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "app_config.hpp"
 #include "driver/uart.h"
@@ -83,6 +84,21 @@ static bool uartReadExact(uart_port_t port, uint8_t *dst, size_t count, TickType
     return true;
 }
 
+static bool getSystemTimeHhMmSs(char *out, size_t out_size) {
+    if (out == nullptr || out_size < 9) {
+        return false;
+    }
+
+    const std::time_t now = std::time(nullptr);
+    std::tm tm_now = {};
+    if (now <= 0 || localtime_r(&now, &tm_now) == nullptr || (tm_now.tm_year + 1900) < 2024) {
+        return false;
+    }
+
+    std::snprintf(out, out_size, "%02d:%02d:%02d", tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+    return true;
+}
+
 // Parse the EPC list from a validated inventory response and publish each tag.
 // 'payload' starts at Status byte; 'payload_len' is the count of bytes from Status to end of CRC.
 static void processInventoryResponse(const uint8_t *payload, size_t payload_len,
@@ -121,7 +137,9 @@ static void processInventoryResponse(const uint8_t *payload, size_t payload_len,
         // Timestamp
         char time_buf[16];
         if (cached_src == TimeSource::kFallback) {
-            std::snprintf(time_buf, sizeof(time_buf), "%lu", static_cast<unsigned long>(now_ms));
+            if (!getSystemTimeHhMmSs(time_buf, sizeof(time_buf))) {
+                std::snprintf(time_buf, sizeof(time_buf), "%lu", static_cast<unsigned long>(now_ms));
+            }
         } else {
             std::snprintf(time_buf, sizeof(time_buf), "%s", cached_time);
         }

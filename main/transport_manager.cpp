@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
+#include <cstdint>
 
 #include "app_config.hpp"
 #include "esp_modem_api.h"
@@ -15,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "sys/time.h"
 
 namespace {
 static const char *TAG = "transport_manager";
@@ -105,6 +108,131 @@ void logSignalQuality(esp_modem_dce_t *dce) {
     } else {
         ESP_LOGW(TAG, "SIM7000 signal read failed: %s", esp_err_to_name(ret));
     }
+}
+
+bool enterCommandModeReady(esp_modem_dce_t *dce) {
+    if (dce == nullptr) {
+        return false;
+    }
+
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        esp_err_t ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "esp_modem_set_mode(COMMAND) attempt %d/3 failed: %s", attempt, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(300));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(300));
+
+        ret = esp_modem_sync(dce);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "esp_modem_sync after COMMAND attempt %d/3 failed: %s", attempt, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(300));
+            continue;
+        }
+
+        ret = esp_modem_set_echo(dce, false);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "esp_modem_set_echo(false) attempt %d/3 failed: %s", attempt, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(300));
+            continue;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned doy = (153U * (month + (month > 2 ? -3U : 9U)) + 2U) / 5U + day - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+bool syncSystemClockFromCclk(esp_modem_dce_t *dce) {
+    if (dce == nullptr) {
+        return false;
+    }
+
+    char out[ESP_MODEM_C_API_STR_BUF_SIZE] = {0};
+    const esp_err_t ret = esp_modem_at(dce, "AT+CCLK?", out, 2500);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "AT+CCLK? failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    const char *line = std::strstr(out, "+CCLK:");
+    if (line == nullptr) {
+        ESP_LOGW(TAG, "AT+CCLK? returned no +CCLK payload: %s", out);
+        return false;
+    }
+
+    int yy = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    int tz_abs = 0;
+    char tz_sign = '+';
+    const int matched = std::sscanf(line,
+                                    "+CCLK: \"%2d/%2d/%2d,%2d:%2d:%2d%c%2d\"",
+                                    &yy,
+                                    &month,
+                                    &day,
+                                    &hour,
+                                    &minute,
+                                    &second,
+                                    &tz_sign,
+                                    &tz_abs);
+    if (matched < 6) {
+        ESP_LOGW(TAG, "Failed parsing +CCLK payload: %s", line);
+        return false;
+    }
+
+    const int year = 2000 + yy;
+    int utc_offset_quarters = 0;
+    if (matched >= 8) {
+        utc_offset_quarters = (tz_sign == '-') ? -tz_abs : tz_abs;
+    }
+    const int offset_seconds = utc_offset_quarters * 15 * 60;
+
+    int64_t epoch = daysFromCivil(year, static_cast<unsigned>(month), static_cast<unsigned>(day)) * 86400LL
+                  + static_cast<int64_t>(hour) * 3600LL
+                  + static_cast<int64_t>(minute) * 60LL
+                  + second;
+    epoch -= offset_seconds;
+    if (epoch < 0) {
+        ESP_LOGW(TAG, "Computed epoch from +CCLK is invalid");
+        return false;
+    }
+
+    const timeval tv = {
+        .tv_sec = static_cast<time_t>(epoch),
+        .tv_usec = 0,
+    };
+    if (settimeofday(&tv, nullptr) != 0) {
+        ESP_LOGW(TAG, "settimeofday failed while applying +CCLK");
+        return false;
+    }
+
+    std::time_t now = static_cast<time_t>(epoch);
+    std::tm tm_local = {};
+    localtime_r(&now, &tm_local);
+    ESP_LOGI(TAG,
+             "System clock set from SIM7000 +CCLK to local %04d-%02d-%02d %02d:%02d:%02d",
+             tm_local.tm_year + 1900,
+             tm_local.tm_mon + 1,
+             tm_local.tm_mday,
+             tm_local.tm_hour,
+             tm_local.tm_min,
+             tm_local.tm_sec);
+    return true;
 }
 }  // namespace
 
@@ -520,57 +648,38 @@ bool TransportManager::ensureGprsConnection() {
              static_cast<int>(dte_config.uart_config.rx_io_num));
 
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(app_config::kSim7000Apn);
+    dte_config.uart_config.baud_rate = app_config::kSim7000UartBaudRate;
     esp_err_t modem_ret = ESP_FAIL;
-    const int baud_candidates[] = {
-        app_config::kSim7000UartBaudRate,
-        115200,
-        9600,
-        57600,
-        38400,
-        19200,
-    };
+    gprs_dce_ = esp_modem_new_dev(ESP_MODEM_DCE_SIM7000, &dte_config, &dce_config, gprs_netif_);
+    if (gprs_dce_ == nullptr) {
+        return fail_gprs("esp_modem_new_dev failed for SIM7000");
+    }
 
+    ESP_LOGI(TAG, "Trying SIM7000 sync at %d baud", app_config::kSim7000UartBaudRate);
     bool modem_synced = false;
-    for (int baud_index = 0; baud_index < static_cast<int>(sizeof(baud_candidates) / sizeof(baud_candidates[0])); ++baud_index) {
-        dte_config.uart_config.baud_rate = baud_candidates[baud_index];
-
-        if (gprs_dce_ != nullptr) {
-            esp_modem_destroy(gprs_dce_);
-            gprs_dce_ = nullptr;
-        }
-
-        gprs_dce_ = esp_modem_new_dev(ESP_MODEM_DCE_SIM7000, &dte_config, &dce_config, gprs_netif_);
-        if (gprs_dce_ == nullptr) {
-            ESP_LOGW(TAG, "esp_modem_new_dev failed for SIM7000 at %d baud", baud_candidates[baud_index]);
-            continue;
-        }
-
-        ESP_LOGI(TAG, "Trying SIM7000 sync at %d baud", baud_candidates[baud_index]);
-        for (int attempt = 1; attempt <= 5; ++attempt) {
-            modem_ret = esp_modem_sync(gprs_dce_);
-            if (modem_ret == ESP_OK) {
-                modem_synced = true;
-                ESP_LOGI(TAG, "SIM7000 sync successful at %d baud", baud_candidates[baud_index]);
-                break;
-            }
-            ESP_LOGW(TAG,
-                     "esp_modem_sync attempt %d/5 failed at %d baud: %s",
-                     attempt,
-                     baud_candidates[baud_index],
-                     esp_err_to_name(modem_ret));
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        if (modem_synced) {
+    for (int attempt = 1; attempt <= 5; ++attempt) {
+        modem_ret = esp_modem_sync(gprs_dce_);
+        if (modem_ret == ESP_OK) {
+            modem_synced = true;
+            ESP_LOGI(TAG, "SIM7000 sync successful at %d baud", app_config::kSim7000UartBaudRate);
             break;
         }
+        ESP_LOGW(TAG,
+                 "esp_modem_sync attempt %d/5 failed at %d baud: %s",
+                 attempt,
+                 app_config::kSim7000UartBaudRate,
+                 esp_err_to_name(modem_ret));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     if (!modem_synced) {
-        return fail_gprs("Modem sync failed at all baud candidates; cannot start PPP", modem_ret);
+        return fail_gprs("Modem sync failed; cannot start PPP", modem_ret);
     }
 
-    (void)esp_modem_set_mode(gprs_dce_, ESP_MODEM_MODE_COMMAND);
-    (void)esp_modem_set_echo(gprs_dce_, false);
+    if (!enterCommandModeReady(gprs_dce_)) {
+        return fail_gprs("Failed to stabilize SIM7000 command mode after sync");
+    }
+
     (void)esp_modem_set_apn(gprs_dce_, app_config::kSim7000Apn);
     ESP_LOGI(TAG, "Applying SIM7000 radio and attach settings");
     (void)esp_modem_set_radio_state(gprs_dce_, 1);
@@ -660,6 +769,8 @@ bool TransportManager::ensureGprsConnection() {
     if (!registered) {
         return fail_gprs("SIM7000 not registered to network; aborting PPP start");
     }
+
+    (void)syncSystemClockFromCclk(gprs_dce_);
 
     int attach_state = 0;
     modem_ret = esp_modem_get_network_attachment_state(gprs_dce_, &attach_state);
