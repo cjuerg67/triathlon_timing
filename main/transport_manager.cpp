@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 #include "app_config.hpp"
 #include "esp_modem_api.h"
@@ -23,84 +24,87 @@ static bool s_eth_handlers_registered = false;
 static bool s_wifi_handlers_registered = false;
 static bool s_ppp_handlers_registered = false;
 
-bool readUartLine(uart_port_t port, char *line, size_t line_size, uint32_t timeout_ms) {
-    if (line == nullptr || line_size < 2) {
+bool isModemRegistered(int reg_state) {
+    return reg_state == 1 || reg_state == 5;
+}
+
+int parseRegistrationStatus(const char *response, const char *prefix) {
+    if (response == nullptr || prefix == nullptr) {
+        return -1;
+    }
+
+    const char *line = std::strstr(response, prefix);
+    if (line == nullptr) {
+        return -1;
+    }
+
+    const char *colon = std::strchr(line, ':');
+    if (colon == nullptr) {
+        return -1;
+    }
+
+    const char *status_ptr = std::strrchr(colon, ',');
+    if (status_ptr != nullptr) {
+        ++status_ptr;
+    } else {
+        status_ptr = colon + 1;
+    }
+
+    while (*status_ptr == ' ' || *status_ptr == '\t') {
+        ++status_ptr;
+    }
+
+    return std::atoi(status_ptr);
+}
+
+bool queryRegisteredByAt(esp_modem_dce_t *dce) {
+    if (dce == nullptr) {
         return false;
     }
 
-    line[0] = '\0';
-    size_t used = 0;
-    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    while (xTaskGetTickCount() < deadline) {
-        uint8_t ch = 0;
-        const int read = uart_read_bytes(port, &ch, 1, pdMS_TO_TICKS(20));
-        if (read <= 0) {
+    const char *cmds[] = { "AT+CREG?", "AT+CGREG?", "AT+CEREG?" };
+    const char *prefixes[] = { "+CREG", "+CGREG", "+CEREG" };
+
+    for (int i = 0; i < 3; ++i) {
+        char out[ESP_MODEM_C_API_STR_BUF_SIZE] = {0};
+        const esp_err_t ret = esp_modem_at(dce, cmds[i], out, 2500);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "%s failed: %s", cmds[i], esp_err_to_name(ret));
             continue;
         }
 
-        if (ch == '\r') {
-            continue;
-        }
-
-        if (ch == '\n') {
-            if (used == 0) {
-                continue;
-            }
-            line[used] = '\0';
+        const int stat = parseRegistrationStatus(out, prefixes[i]);
+        ESP_LOGI(TAG, "%s status=%d raw=%s", prefixes[i], stat, out);
+        if (isModemRegistered(stat)) {
             return true;
         }
-
-        if (used < (line_size - 1)) {
-            line[used++] = static_cast<char>(ch);
-        }
     }
 
-    if (used > 0) {
-        line[used] = '\0';
-        return true;
-    }
     return false;
 }
 
-bool sim7000Command(uart_port_t port,
-                    const char *cmd,
-                    uint32_t timeout_ms,
-                    char *first_data_line,
-                    size_t first_data_line_size) {
-    if (cmd == nullptr) {
-        return false;
+void runAtBestEffort(esp_modem_dce_t *dce, const char *cmd, int timeout_ms) {
+    if (dce == nullptr || cmd == nullptr) {
+        return;
     }
-
-    if (first_data_line != nullptr && first_data_line_size > 0) {
-        first_data_line[0] = '\0';
+    char out[ESP_MODEM_C_API_STR_BUF_SIZE] = {0};
+    const esp_err_t ret = esp_modem_at(dce, cmd, out, timeout_ms);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "AT %s -> %s", cmd, out[0] != '\0' ? out : "OK");
+    } else {
+        ESP_LOGW(TAG, "AT %s failed: %s", cmd, esp_err_to_name(ret));
     }
+}
 
-    uart_flush(port);
-    (void)uart_write_bytes(port, cmd, std::strlen(cmd));
-    (void)uart_write_bytes(port, "\r\n", 2);
-
-    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    while (xTaskGetTickCount() < deadline) {
-        char line[160] = {0};
-        if (!readUartLine(port, line, sizeof(line), 200)) {
-            continue;
-        }
-
-        if (std::strcmp(line, "OK") == 0) {
-            return true;
-        }
-        if (std::strcmp(line, "ERROR") == 0 || std::strstr(line, "+CME ERROR") != nullptr) {
-            ESP_LOGW(TAG, "SIM7000 cmd failed: %s -> %s", cmd, line);
-            return false;
-        }
-
-        if (first_data_line != nullptr && first_data_line_size > 0 && first_data_line[0] == '\0') {
-            std::snprintf(first_data_line, first_data_line_size, "%s", line);
-        }
+void logSignalQuality(esp_modem_dce_t *dce) {
+    int rssi = 0;
+    int ber = 0;
+    const esp_err_t ret = esp_modem_get_signal_quality(dce, &rssi, &ber);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SIM7000 signal rssi=%d ber=%d", rssi, ber);
+    } else {
+        ESP_LOGW(TAG, "SIM7000 signal read failed: %s", esp_err_to_name(ret));
     }
-
-    ESP_LOGW(TAG, "SIM7000 cmd timeout: %s", cmd);
-    return false;
 }
 }  // namespace
 
@@ -158,6 +162,10 @@ bool TransportManager::refreshActiveTransport() {
                  "Active transport changed %d -> %d",
                  static_cast<int>(previous),
                  static_cast<int>(active_transport_));
+        setDefaultNetifForActiveTransport();
+    } else if (active_transport_ != TransportType::kNone) {
+        // Keep the default route aligned with the selected transport.
+        setDefaultNetifForActiveTransport();
     } else if (app_config::kEnableVerboseTransportLogs) {
         ESP_LOGI(TAG,
                  "Transport refresh stable=%d wifi=%d eth_link=%d eth_ip=%d gprs=%d",
@@ -415,9 +423,26 @@ bool TransportManager::ensureGprsConnection() {
         return true;
     }
 
-    if (gprs_initialized_) {
-        return gprs_ready_;
+    if (gprs_initialized_ && !gprs_ready_) {
+        ESP_LOGW(TAG, "Retrying SIM7000 PPP bring-up after previous failure");
     }
+
+    auto fail_gprs = [this](const char *message, esp_err_t err = ESP_FAIL) {
+        if (message != nullptr) {
+            if (err == ESP_FAIL) {
+                ESP_LOGE(TAG, "%s", message);
+            } else {
+                ESP_LOGE(TAG, "%s: %s", message, esp_err_to_name(err));
+            }
+        }
+        if (gprs_dce_ != nullptr) {
+            esp_modem_destroy(gprs_dce_);
+            gprs_dce_ = nullptr;
+        }
+        gprs_ready_ = false;
+        gprs_initialized_ = false;
+        return false;
+    };
 
     esp_err_t ret = ESP_OK;
     if (!s_netif_initialized) {
@@ -457,9 +482,17 @@ bool TransportManager::ensureGprsConnection() {
     esp_netif_ppp_set_params(gprs_netif_, &ppp_config);
 
     if (!s_ppp_handlers_registered) {
-        ret = esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &TransportManager::gotIpEventHandler, this);
+        ret = esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, &TransportManager::gotIpEventHandler, this);
         if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGE(TAG, "Register PPP IP event handler failed: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Register PPP got IP event handler failed: %s", esp_err_to_name(ret));
+            gprs_initialized_ = true;
+            gprs_ready_ = false;
+            return false;
+        }
+
+        ret = esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, &TransportManager::gotIpEventHandler, this);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Register PPP lost IP event handler failed: %s", esp_err_to_name(ret));
             gprs_initialized_ = true;
             gprs_ready_ = false;
             return false;
@@ -467,81 +500,12 @@ bool TransportManager::ensureGprsConnection() {
         s_ppp_handlers_registered = true;
     }
 
-    const uart_port_t port = static_cast<uart_port_t>(app_config::kSim7000UartPort);
-    if (!uart_is_driver_installed(port)) {
-        const esp_err_t install_ret = uart_driver_install(port, 4096, 512, 0, nullptr, 0);
-        if (install_ret != ESP_OK) {
-            ESP_LOGE(TAG, "SIM7000 UART driver install failed: %s", esp_err_to_name(install_ret));
-            gprs_initialized_ = true;
-            gprs_ready_ = false;
-            return false;
-        }
-    }
-
-    const uart_config_t uart_cfg = {
-        .baud_rate = app_config::kSim7000UartBaudRate,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .rx_flow_ctrl_thresh = 0,
-        .source_clk = UART_SCLK_DEFAULT,
-        .flags = {.allow_pd = 0, .backup_before_sleep = 0},
-    };
-
-    if (uart_param_config(port, &uart_cfg) != ESP_OK ||
-        uart_set_pin(port,
-                     app_config::kSim7000UartTxPin,
-                     app_config::kSim7000UartRxPin,
-                     UART_PIN_NO_CHANGE,
-                     UART_PIN_NO_CHANGE) != ESP_OK) {
-        ESP_LOGE(TAG, "SIM7000 UART config failed");
-        gprs_initialized_ = true;
-        gprs_ready_ = false;
-        return false;
-    }
-
-    char line[160] = {0};
-    if (!sim7000Command(port, "AT", 2000, nullptr, 0) ||
-        !sim7000Command(port, "ATE0", 2000, nullptr, 0)) {
-        ESP_LOGW(TAG, "SIM7000 not responding to AT");
-        gprs_initialized_ = true;
-        gprs_ready_ = false;
-        return false;
-    }
-
-    if (!sim7000Command(port, "AT+CPIN?", 4000, line, sizeof(line)) ||
-        std::strstr(line, "READY") == nullptr) {
-        ESP_LOGW(TAG, "SIM7000 SIM not ready: %s", line);
-        gprs_initialized_ = true;
-        gprs_ready_ = false;
-        return false;
-    }
-
-    char pdp_cmd[196] = {0};
-    std::snprintf(pdp_cmd, sizeof(pdp_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", app_config::kSim7000Apn);
-    if (!sim7000Command(port, "AT+CGATT=1", 20000, nullptr, 0) ||
-        !sim7000Command(port, pdp_cmd, 5000, nullptr, 0) ||
-        !sim7000Command(port, "AT+CGACT=1,1", 30000, nullptr, 0) ||
-        !sim7000Command(port, "AT+CGPADDR=1", 5000, line, sizeof(line))) {
-        ESP_LOGW(TAG, "SIM7000 PDP activation failed");
-        gprs_initialized_ = true;
-        gprs_ready_ = false;
-        return false;
-    }
-
-    if (std::strstr(line, "0.0.0.0") != nullptr) {
-        ESP_LOGW(TAG, "SIM7000 PDP has no valid IP: %s", line);
-        gprs_initialized_ = true;
-        gprs_ready_ = false;
-        return false;
-    }
-
-    ESP_LOGI(TAG, "SIM7000 packet domain ready: %s", line);
-
     esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
+    dte_config.uart_config.port_num = static_cast<uart_port_t>(app_config::kSim7000UartPort);
     dte_config.uart_config.tx_io_num = app_config::kSim7000UartTxPin;
     dte_config.uart_config.rx_io_num = app_config::kSim7000UartRxPin;
+    dte_config.uart_config.rts_io_num = UART_PIN_NO_CHANGE;
+    dte_config.uart_config.cts_io_num = UART_PIN_NO_CHANGE;
     dte_config.uart_config.flow_control = ESP_MODEM_FLOW_CONTROL_NONE;
     dte_config.uart_config.rx_buffer_size = 2048;
     dte_config.uart_config.tx_buffer_size = 2048;
@@ -549,21 +513,184 @@ bool TransportManager::ensureGprsConnection() {
     dte_config.task_stack_size = 4096;
     dte_config.task_priority = 5;
 
+    ESP_LOGI(TAG,
+             "SIM7000 UART config port=%d tx=%d rx=%d",
+             static_cast<int>(dte_config.uart_config.port_num),
+             static_cast<int>(dte_config.uart_config.tx_io_num),
+             static_cast<int>(dte_config.uart_config.rx_io_num));
+
     esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(app_config::kSim7000Apn);
-    gprs_dce_ = esp_modem_new_dev(ESP_MODEM_DCE_SIM7000, &dte_config, &dce_config, gprs_netif_);
-    if (gprs_dce_ == nullptr) {
-        ESP_LOGE(TAG, "esp_modem_new_dev failed for SIM7000");
-        gprs_initialized_ = true;
-        gprs_ready_ = false;
-        return false;
+    esp_err_t modem_ret = ESP_FAIL;
+    const int baud_candidates[] = {
+        app_config::kSim7000UartBaudRate,
+        115200,
+        9600,
+        57600,
+        38400,
+        19200,
+    };
+
+    bool modem_synced = false;
+    for (int baud_index = 0; baud_index < static_cast<int>(sizeof(baud_candidates) / sizeof(baud_candidates[0])); ++baud_index) {
+        dte_config.uart_config.baud_rate = baud_candidates[baud_index];
+
+        if (gprs_dce_ != nullptr) {
+            esp_modem_destroy(gprs_dce_);
+            gprs_dce_ = nullptr;
+        }
+
+        gprs_dce_ = esp_modem_new_dev(ESP_MODEM_DCE_SIM7000, &dte_config, &dce_config, gprs_netif_);
+        if (gprs_dce_ == nullptr) {
+            ESP_LOGW(TAG, "esp_modem_new_dev failed for SIM7000 at %d baud", baud_candidates[baud_index]);
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Trying SIM7000 sync at %d baud", baud_candidates[baud_index]);
+        for (int attempt = 1; attempt <= 5; ++attempt) {
+            modem_ret = esp_modem_sync(gprs_dce_);
+            if (modem_ret == ESP_OK) {
+                modem_synced = true;
+                ESP_LOGI(TAG, "SIM7000 sync successful at %d baud", baud_candidates[baud_index]);
+                break;
+            }
+            ESP_LOGW(TAG,
+                     "esp_modem_sync attempt %d/5 failed at %d baud: %s",
+                     attempt,
+                     baud_candidates[baud_index],
+                     esp_err_to_name(modem_ret));
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (modem_synced) {
+            break;
+        }
     }
 
-    ret = esp_modem_set_mode(gprs_dce_, ESP_MODEM_MODE_DATA);
+    if (!modem_synced) {
+        return fail_gprs("Modem sync failed at all baud candidates; cannot start PPP", modem_ret);
+    }
+
+    (void)esp_modem_set_mode(gprs_dce_, ESP_MODEM_MODE_COMMAND);
+    (void)esp_modem_set_echo(gprs_dce_, false);
+    (void)esp_modem_set_apn(gprs_dce_, app_config::kSim7000Apn);
+    ESP_LOGI(TAG, "Applying SIM7000 radio and attach settings");
+    (void)esp_modem_set_radio_state(gprs_dce_, 1);
+    (void)esp_modem_set_network_attachment_state(gprs_dce_, 1);
+    logSignalQuality(gprs_dce_);
+
+    esp_modem_sim_pin_state_t pin_state = ESP_MODEM_SIM_PIN_STATE_UNKNOWN;
+    modem_ret = esp_modem_read_pin_state(gprs_dce_, &pin_state);
+    if (modem_ret != ESP_OK) {
+        ESP_LOGW(TAG, "CPIN read failed: %s", esp_err_to_name(modem_ret));
+    } else if (pin_state != ESP_MODEM_SIM_PIN_STATE_READY) {
+        ESP_LOGE(TAG, "SIM not ready (CPIN state=%d)", static_cast<int>(pin_state));
+        return fail_gprs(nullptr);
+    }
+
+    int reg_state = 0;
+    bool registered = false;
+    ESP_LOGI(TAG, "Waiting for SIM7000 network registration");
+    for (int attempt = 1; attempt <= 90; ++attempt) {
+        modem_ret = esp_modem_get_network_registration_state(gprs_dce_, &reg_state);
+        if (modem_ret == ESP_OK && isModemRegistered(reg_state)) {
+            registered = true;
+            break;
+        }
+
+        if (attempt % 5 == 0 && queryRegisteredByAt(gprs_dce_)) {
+            ESP_LOGI(TAG, "AT fallback confirms SIM7000 is registered");
+            registered = true;
+            break;
+        }
+
+        // If the modem is not searching, nudge it back to full radio and attached state.
+        if (modem_ret == ESP_OK && reg_state == 0 && (attempt == 10 || attempt == 30 || attempt == 60)) {
+            ESP_LOGW(TAG, "Registration state=0; forcing radio full mode and attached state");
+            (void)esp_modem_set_radio_state(gprs_dce_, 1);
+            (void)esp_modem_set_network_attachment_state(gprs_dce_, 1);
+            logSignalQuality(gprs_dce_);
+        }
+
+        if (modem_ret == ESP_OK && reg_state == 0 && attempt == 20) {
+            ESP_LOGW(TAG, "Registration state=0 persists; toggling attach state");
+            (void)esp_modem_set_network_attachment_state(gprs_dce_, 0);
+            vTaskDelay(pdMS_TO_TICKS(1200));
+            (void)esp_modem_set_network_attachment_state(gprs_dce_, 1);
+            runAtBestEffort(gprs_dce_, "AT+CGATT?", 2000);
+        }
+
+        if (modem_ret == ESP_OK && reg_state == 0 && attempt == 40) {
+            ESP_LOGW(TAG, "Registration state=0 persists; forcing automatic operator search");
+            runAtBestEffort(gprs_dce_, "AT+COPS=0", 3000);
+            runAtBestEffort(gprs_dce_, "AT+COPS?", 3000);
+        }
+
+        if (modem_ret == ESP_OK && reg_state == 0 && attempt == 70) {
+            ESP_LOGW(TAG, "Registration state=0 persists; cycling modem radio");
+            (void)esp_modem_set_radio_state(gprs_dce_, 0);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            (void)esp_modem_set_radio_state(gprs_dce_, 1);
+            runAtBestEffort(gprs_dce_, "AT+CREG?", 2000);
+            runAtBestEffort(gprs_dce_, "AT+CEREG?", 2000);
+            logSignalQuality(gprs_dce_);
+        }
+
+        if (modem_ret == ESP_OK && reg_state == 0 && attempt == 80) {
+            ESP_LOGW(TAG, "Registration state=0 persists; resetting SIM7000");
+            const esp_err_t reset_ret = esp_modem_reset(gprs_dce_);
+            ESP_LOGW(TAG, "esp_modem_reset result: %s", esp_err_to_name(reset_ret));
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            (void)esp_modem_sync(gprs_dce_);
+            (void)esp_modem_set_mode(gprs_dce_, ESP_MODEM_MODE_COMMAND);
+            (void)esp_modem_set_echo(gprs_dce_, false);
+            (void)esp_modem_set_apn(gprs_dce_, app_config::kSim7000Apn);
+            (void)esp_modem_set_radio_state(gprs_dce_, 1);
+            (void)esp_modem_set_network_attachment_state(gprs_dce_, 1);
+            runAtBestEffort(gprs_dce_, "AT+CPIN?", 2000);
+        }
+
+        if (attempt % 5 == 0) {
+            ESP_LOGW(TAG,
+                     "Network registration pending (attempt %d/90, state=%d, ret=%s)",
+                     attempt,
+                     reg_state,
+                     esp_err_to_name(modem_ret));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (!registered) {
+        return fail_gprs("SIM7000 not registered to network; aborting PPP start");
+    }
+
+    int attach_state = 0;
+    modem_ret = esp_modem_get_network_attachment_state(gprs_dce_, &attach_state);
+    if (modem_ret != ESP_OK || attach_state != 1) {
+        modem_ret = esp_modem_set_network_attachment_state(gprs_dce_, 1);
+        if (modem_ret != ESP_OK) {
+            return fail_gprs("Failed to request GPRS attach", modem_ret);
+        }
+        for (int attempt = 1; attempt <= 15; ++attempt) {
+            modem_ret = esp_modem_get_network_attachment_state(gprs_dce_, &attach_state);
+            if (modem_ret == ESP_OK && attach_state == 1) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        if (attach_state != 1) {
+            return fail_gprs("GPRS attachment did not complete");
+        }
+    }
+
+    ret = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        ret = esp_modem_set_mode(gprs_dce_, ESP_MODEM_MODE_DATA);
+        if (ret == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "esp_modem_set_mode(DATA) attempt %d/3 failed: %s", attempt, esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_modem_set_mode(DATA) failed: %s", esp_err_to_name(ret));
-        gprs_initialized_ = true;
-        gprs_ready_ = false;
-        return false;
+        return fail_gprs("esp_modem_set_mode(DATA) failed", ret);
     }
 
     for (int attempt = 0; attempt < 120 && !gprs_ready_; ++attempt) {
@@ -571,14 +698,28 @@ bool TransportManager::ensureGprsConnection() {
     }
 
     if (!gprs_ready_) {
-        ESP_LOGW(TAG, "PPP did not obtain IP in time");
-        gprs_initialized_ = true;
-        return false;
+        return fail_gprs("PPP did not obtain IP in time");
     }
 
     gprs_initialized_ = true;
     gprs_ready_ = true;
     return true;
+}
+
+void TransportManager::setDefaultNetifForActiveTransport() {
+    if (active_transport_ == TransportType::kGprs && gprs_netif_ != nullptr && gprs_ready_) {
+        esp_netif_set_default_netif(gprs_netif_);
+        return;
+    }
+
+    if (active_transport_ == TransportType::kEthernet && ethernet_netif_ != nullptr && ethernet_link_up_ && ethernet_got_ip_) {
+        esp_netif_set_default_netif(ethernet_netif_);
+        return;
+    }
+
+    if (active_transport_ == TransportType::kWifi && wifi_netif_ != nullptr && wifi_connected_) {
+        esp_netif_set_default_netif(wifi_netif_);
+    }
 }
 
 void TransportManager::wifiEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -661,7 +802,6 @@ void TransportManager::ethEventHandler(void *arg, esp_event_base_t event_base, i
 
 void TransportManager::gotIpEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     (void)event_base;
-    (void)event_id;
 
     auto *self = static_cast<TransportManager *>(arg);
     if (self == nullptr) {
@@ -674,9 +814,7 @@ void TransportManager::gotIpEventHandler(void *arg, esp_event_base_t event_base,
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_PPP_GOT_IP) {
         self->gprs_ready_ = true;
-        if (self->gprs_netif_ != nullptr) {
-            esp_netif_set_default_netif(self->gprs_netif_);
-        }
+        self->setDefaultNetifForActiveTransport();
         ESP_LOGI(TAG, "SIM7000 PPP got IP");
         return;
     }
@@ -687,9 +825,9 @@ void TransportManager::gotIpEventHandler(void *arg, esp_event_base_t event_base,
         return;
     }
 
-    self->ethernet_got_ip_ = true;
-    if (self->ethernet_netif_ != nullptr) {
-        esp_netif_set_default_netif(self->ethernet_netif_);
+    if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
+        self->ethernet_got_ip_ = true;
+        self->setDefaultNetifForActiveTransport();
+        ESP_LOGI(TAG, "Ethernet interface received an IP address");
     }
-    ESP_LOGI(TAG, "Ethernet interface received an IP address");
 }

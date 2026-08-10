@@ -30,6 +30,14 @@ static int64_t daysFromCivil(int year, unsigned month, unsigned day) {
 }
 
 TimeService::TimeService() {
+    if (app_config::kEnableGprsTransport) {
+        ESP_LOGI(TAG, "Skipping SIM7000 AT time channel because PPP transport owns the modem UART");
+        setenv("TZ", app_config::kTimezone, 1);
+        tzset();
+        ESP_LOGI(TAG, "Timezone set to %s", app_config::kTimezone);
+        return;
+    }
+
     const uart_config_t uart_cfg = {
         .baud_rate = app_config::kSim7000UartBaudRate,
         .data_bits = UART_DATA_8_BITS,
@@ -214,14 +222,28 @@ bool TimeService::parseGsmClock(const char *line,
     }
 
     int yy = 0;
-    int tz = 0;
-    int matched = std::sscanf(line, "+CCLK: \"%2d/%2d/%2d,%2d:%2d:%2d%2d\"", &yy, &month, &day, &hour, &minute, &second, &tz);
+    int tz_abs = 0;
+    char tz_sign = '+';
+    int matched = std::sscanf(line,
+                              "+CCLK: \"%2d/%2d/%2d,%2d:%2d:%2d%c%2d\"",
+                              &yy,
+                              &month,
+                              &day,
+                              &hour,
+                              &minute,
+                              &second,
+                              &tz_sign,
+                              &tz_abs);
     if (matched < 6) {
         return false;
     }
 
     year = 2000 + yy;
-    utc_offset_quarters = tz;
+    if (matched >= 8) {
+        utc_offset_quarters = (tz_sign == '-') ? -tz_abs : tz_abs;
+    } else {
+        utc_offset_quarters = 0;
+    }
     return true;
 }
 
@@ -358,9 +380,6 @@ bool TimeService::tryGetGsmNetworkTime(int &hour, int &minute, int &second) cons
     if (epoch < 0) {
         return false;
     }
-
-    const int utc_year = 1970; // placeholder for logging below
-    (void)utc_year;
 
     const int utc_hour = static_cast<int>((epoch % 86400LL) / 3600LL);
     const int utc_minute = static_cast<int>((epoch % 3600LL) / 60LL);

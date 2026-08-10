@@ -22,6 +22,7 @@ private:
     bool ensureWifiConnection();
     bool ensureEthernetConnection();
     bool ensureGprsConnection();
+    void setDefaultNetifForActiveTransport();
     static void wifiEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
     static void wifiGotIpEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
     static void ethEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);

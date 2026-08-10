@@ -57,7 +57,7 @@ namespace app_config {
 
     // SIM7000 GPRS modem — adjust pins to match your board wiring
     static constexpr int kSim7000UartPort = 2;
-    static constexpr int kSim7000UartTxPin = 23;
+    static constexpr int kSim7000UartTxPin = 25;
     static constexpr int kSim7000UartRxPin = 22;
     static constexpr int kSim7000UartBaudRate = 115200;
     static constexpr const char *kSim7000Apn = "iot.1nce.net";
