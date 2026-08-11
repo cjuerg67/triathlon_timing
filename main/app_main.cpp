@@ -13,6 +13,8 @@
 #include "status_lcd.hpp"
 #include "cf_e714_reader.hpp"
 #include "keyboard_reader.hpp"
+#include "config_portal.hpp"
+#include "runtime_settings.hpp"
 #include "yrm100_reader.hpp"
 
 namespace {
@@ -32,8 +34,16 @@ const char *transportName(TransportType transport) {
     }
 }
 
-const char *brokerForTransport(TransportType transport) {
-    return (transport == TransportType::kGprs) ? app_config::kMqttBrokerGprs : app_config::kMqttBrokerLan;
+void brokerForTransport(TransportType transport, char *out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return;
+    }
+
+    if (transport == TransportType::kGprs) {
+        runtime_settings::getGprsBrokerUri(out, out_size);
+    } else {
+        runtime_settings::getLanBrokerUri(out, out_size);
+    }
 }
 }
 
@@ -51,6 +61,15 @@ extern "C" void app_main(void) {
     static Yrm100Reader yrm100_reader;
     static CfE714Reader cf_e714_reader;
     static KeyboardReader keyboard_reader;
+    static ConfigPortal config_portal;
+
+    if (runtime_settings::init() != ESP_OK) {
+        ESP_LOGW(TAG, "Runtime settings init failed; using compile-time MQTT defaults");
+    }
+
+    if (app_config::kEnableConfigPortal) {
+        ESP_LOGI(TAG, "Config portal will wait until Wi‑Fi or LAN connectivity is established before starting");
+    }
 
     if (app_config::kEnableStatusLcd) {
         const esp_err_t lcd_init_ret = status_lcd.init();
@@ -61,8 +80,28 @@ extern "C" void app_main(void) {
 
     bool connected_transport = transport_manager.connectAny();
     TransportType active_transport = transport_manager.activeTransport();
-    const char *broker_uri = brokerForTransport(active_transport);
-    ESP_LOGI(TAG, "transport connected=%d broker=%s", connected_transport, broker_uri != nullptr ? broker_uri : "null");
+    if (app_config::kEnableConfigPortal) {
+        if (connected_transport && active_transport == TransportType::kWifi) {
+            const esp_err_t portal_ret = config_portal.start(false);
+            if (portal_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Config portal start failed on active Wi‑Fi: %s", esp_err_to_name(portal_ret));
+            }
+        } else if (connected_transport && active_transport == TransportType::kEthernet) {
+            const esp_err_t portal_ret = config_portal.start(false);
+            if (portal_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Config portal start failed on active LAN: %s", esp_err_to_name(portal_ret));
+            }
+        } else {
+            ESP_LOGI(TAG,
+                     "Config portal waiting: no established Wi‑Fi or LAN transport yet (active=%d connected=%d)",
+                     static_cast<int>(active_transport),
+                     connected_transport);
+        }
+    }
+
+    char broker_uri[96] = {0};
+    brokerForTransport(active_transport, broker_uri, sizeof(broker_uri));
+    ESP_LOGI(TAG, "transport connected=%d broker=%s", connected_transport, broker_uri);
 
     if (connected_transport) {
         time_service.initNtp();
@@ -102,11 +141,26 @@ extern "C" void app_main(void) {
             const TransportType previous_transport = active_transport;
             connected_transport = transport_manager.refreshActiveTransport();
             active_transport = transport_manager.activeTransport();
+            char desired_broker_uri[96] = {0};
+            brokerForTransport(active_transport, desired_broker_uri, sizeof(desired_broker_uri));
 
-            if (connected_transport && active_transport != previous_transport) {
-                broker_uri = brokerForTransport(active_transport);
+            if (app_config::kEnableConfigPortal && !config_portal.isRunning() && connected_transport) {
+                const bool use_soft_ap = (active_transport != TransportType::kWifi && active_transport != TransportType::kEthernet);
+                const esp_err_t portal_ret = config_portal.start(use_soft_ap);
+                if (portal_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Config portal start failed after transport came up: %s", esp_err_to_name(portal_ret));
+                } else {
+                    ESP_LOGI(TAG, "Config portal started after transport became ready on %s (soft_ap=%d)",
+                             transportName(active_transport),
+                             use_soft_ap);
+                }
+            }
+
+            if (connected_transport &&
+                (active_transport != previous_transport || std::strncmp(broker_uri, desired_broker_uri, sizeof(broker_uri)) != 0)) {
+                std::snprintf(broker_uri, sizeof(broker_uri), "%s", desired_broker_uri);
                 ESP_LOGW(TAG, "Transport switch detected. Restarting MQTT on %s",
-                         broker_uri != nullptr ? broker_uri : "null");
+                         broker_uri);
                 const esp_err_t switch_ret = mqtt_publisher.start(broker_uri, app_config::kMqttClientId);
                 if (switch_ret != ESP_OK) {
                     ESP_LOGW(TAG, "MQTT restart after transport switch failed: %s", esp_err_to_name(switch_ret));
@@ -133,7 +187,7 @@ extern "C" void app_main(void) {
                      transportName(active_transport),
                      connected_transport,
                      mqtt_publisher.isConnected(),
-                     broker_uri != nullptr ? broker_uri : "null",
+                     broker_uri,
                      static_cast<unsigned long>(mqtt_retry_interval_ms));
             last_status_log = now_ticks;
         }
@@ -144,12 +198,12 @@ extern "C" void app_main(void) {
         }
 
         if (connected_transport && !mqtt_publisher.isConnected() && now_ticks >= next_mqtt_retry) {
-            broker_uri = brokerForTransport(active_transport);
+            brokerForTransport(active_transport, broker_uri, sizeof(broker_uri));
             if (app_config::kEnableVerboseTransportLogs) {
                 ESP_LOGI(TAG,
                          "MQTT retry on transport=%d broker=%s interval_ms=%lu",
                          static_cast<int>(active_transport),
-                         broker_uri != nullptr ? broker_uri : "null",
+                         broker_uri,
                          static_cast<unsigned long>(mqtt_retry_interval_ms));
             }
             const esp_err_t mqtt_retry_ret = mqtt_publisher.start(broker_uri, app_config::kMqttClientId);

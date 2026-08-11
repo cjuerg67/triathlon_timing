@@ -1,6 +1,7 @@
 ## IDF Component Manager Manifest File
 
 dependencies:
+  espressif/network_provisioning: "*"
   espressif/esp_modem: "*"
   espressif/mqtt: "*"
   espressif/usb_host_vcp: '*'

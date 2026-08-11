@@ -30,6 +30,7 @@ private:
     static void usbLibDaemonTask(void *pvParameters);
     static void rfidTask(void *pvParameters);
     static void timeUpdateTask(void *pvParameters);
+    static void publishTask(void *pvParameters);
     static void usbEventCallback(const usb_host_client_event_msg_t *event_msg, void *arg);
     static bool readerDataCallback(const uint8_t *data, size_t data_len, void *user_arg);
     static bool waitForNewFrame(ReaderRxState *state, size_t previous_valid_frames, uint32_t timeout_ms);

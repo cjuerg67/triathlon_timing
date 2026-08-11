@@ -4,9 +4,20 @@
 
 namespace app_config {
 
+    // Runtime config portal (SoftAP + HTTPS)
+    // Enabled: the portal starts only after a valid Wi‑Fi or LAN connection is established.
+    static constexpr bool kEnableConfigPortal = true;
+    static constexpr const char *kConfigPortalApSsid = "triathlon-config";
+    static constexpr const char *kConfigPortalApPassword = "triathlon123";
+    static constexpr int kConfigPortalHttpsPort = 443;
+    static constexpr const char *kConfigPortalUsername = "admin";
+    static constexpr const char *kConfigPortalPassword = "triathloncfg";
+    static constexpr const char *kConfigPortalBasicAuthValue = "Basic YWRtaW46dHJpYXRobG9uY2Zn";
+
     // Wi-Fi
-    static constexpr const char *kWifiSsid = "***REMOVED***";
-    static constexpr const char *kWifiPassword = "***REMOVED***";
+    static constexpr bool kEnableWifiTransport = true;
+    static constexpr const char *kWifiProvisioningServicePrefix = "triathlon";
+    static constexpr const char *kWifiProvisioningPop = "triathlon123";
     static constexpr uint32_t kWifiConnectTimeoutMs = 10000;
     static constexpr int kC6UartPort = 0;
     static constexpr int kC6UartTxPin = 5;

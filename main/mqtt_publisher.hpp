@@ -4,6 +4,7 @@
 
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "mqtt_client.h"
 #include "time_service.hpp"
 
@@ -24,5 +25,9 @@ private:
     char broker_uri_[96] = {0};
     char last_tag_[64] = {0};
     char last_tag_time_[16] = {0};
+    SemaphoreHandle_t publish_ack_sem_ = nullptr;
+    int pending_ack_msg_id_ = -1;
+    bool pending_ack_wait_ = false;
+    bool pending_ack_confirmed_ = false;
     mutable portMUX_TYPE state_lock_ = portMUX_INITIALIZER_UNLOCKED;
 };

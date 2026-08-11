@@ -7,6 +7,7 @@
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "app_config.hpp"
 #include "rfid_event.hpp"
@@ -21,8 +22,19 @@ static constexpr bool kVerboseLogs = false;
 static constexpr uint32_t kInventoryPollIntervalMs = 120;
 static constexpr uint32_t kInventoryTxTimeoutMs = 300;
 static constexpr uint32_t kInventoryErrorBackoffMs = 500;
+static constexpr uint32_t kReaderReconnectDelayMs = 1000;
+static constexpr uint32_t kMultiModeHealthCheckMs = 3000;
+static constexpr uint32_t kSingleModeMaxConsecutiveErrors = 8;
+static constexpr uint32_t kMultiModeMaxConsecutiveErrors = 3;
 static constexpr size_t kConfirmSlots = 24;
 static constexpr uint16_t kReadMultiLoopCount = 0xFFFF;
+static constexpr uint32_t kTagPublishQueueLen = 128;
+static constexpr uint32_t kPublishRetryIntervalMs = 250;
+static constexpr uint32_t kPublishStatsLogIntervalMs = 10000;
+static TaskHandle_t s_usb_daemon_task_handle = nullptr;
+static TaskHandle_t s_rfid_task_handle = nullptr;
+static TaskHandle_t s_time_update_task_handle = nullptr;
+static TaskHandle_t s_publish_task_handle = nullptr;
 
 #define YRM100_STATUS_LOG(...)                               \
     do {                                                     \
@@ -57,6 +69,56 @@ struct ConfirmEntry {
 };
 
 ConfirmEntry s_confirm_entries[kConfirmSlots] = {};
+
+struct PendingTagPublish {
+    char epc[96];
+    char time_buf[16];
+};
+
+struct PublishCounters {
+    uint32_t queued;
+    uint32_t published;
+    uint32_t retried;
+    uint32_t dropped_oldest;
+};
+
+QueueHandle_t s_tag_publish_queue = nullptr;
+PublishCounters s_publish_counters = {};
+portMUX_TYPE s_publish_counters_lock = portMUX_INITIALIZER_UNLOCKED;
+
+void incrementQueuedCounter() {
+    taskENTER_CRITICAL(&s_publish_counters_lock);
+    s_publish_counters.queued++;
+    taskEXIT_CRITICAL(&s_publish_counters_lock);
+}
+
+void incrementPublishedCounter() {
+    taskENTER_CRITICAL(&s_publish_counters_lock);
+    s_publish_counters.published++;
+    taskEXIT_CRITICAL(&s_publish_counters_lock);
+}
+
+void incrementRetriedCounter() {
+    taskENTER_CRITICAL(&s_publish_counters_lock);
+    s_publish_counters.retried++;
+    taskEXIT_CRITICAL(&s_publish_counters_lock);
+}
+
+void logPublishCounters() {
+    PublishCounters snapshot = {};
+    taskENTER_CRITICAL(&s_publish_counters_lock);
+    snapshot = s_publish_counters;
+    taskEXIT_CRITICAL(&s_publish_counters_lock);
+
+    const UBaseType_t queue_depth = (s_tag_publish_queue != nullptr) ? uxQueueMessagesWaiting(s_tag_publish_queue) : 0;
+    ESP_LOGI(TAG,
+             "publish stats queued=%lu published=%lu retried=%lu dropped_oldest=%lu queue_depth=%lu",
+             static_cast<unsigned long>(snapshot.queued),
+             static_cast<unsigned long>(snapshot.published),
+             static_cast<unsigned long>(snapshot.retried),
+             static_cast<unsigned long>(snapshot.dropped_oldest),
+             static_cast<unsigned long>(queue_depth));
+}
 
 bool extractEpcWindow(const uint8_t *tag_data,
                       size_t data_len,
@@ -145,6 +207,46 @@ usb_host_client_handle_t Yrm100Reader::s_client_handle = nullptr;
 char Yrm100Reader::s_cached_time[16] = "00:00:00";
 TimeSource Yrm100Reader::s_cached_time_src = TimeSource::kFallback;
 static RfidDeduplicator s_deduplicator(app_config::kRfidDuplicateDebounceMs);
+
+void Yrm100Reader::publishTask(void *pvParameters) {
+    (void)pvParameters;
+
+    PendingTagPublish item = {};
+    TickType_t last_stats_log = xTaskGetTickCount();
+    while (true) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - last_stats_log) >= pdMS_TO_TICKS(kPublishStatsLogIntervalMs)) {
+            logPublishCounters();
+            last_stats_log = now;
+        }
+
+        if (s_tag_publish_queue == nullptr) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        if (Yrm100Reader::s_mqtt_publisher == nullptr || !Yrm100Reader::s_mqtt_publisher->isConnected()) {
+            // Keep queued events buffered while link is down; don't drain queue.
+            vTaskDelay(pdMS_TO_TICKS(kPublishRetryIntervalMs));
+            continue;
+        }
+
+        if (xQueueReceive(s_tag_publish_queue, &item, pdMS_TO_TICKS(100)) == pdTRUE) {
+            const bool published = Yrm100Reader::s_mqtt_publisher->publishTag(item.epc, item.time_buf);
+            if (!published) {
+                incrementRetriedCounter();
+                // Put failed item back to the head and keep retrying until retained.
+                while (xQueueSendToFront(s_tag_publish_queue, &item, pdMS_TO_TICKS(20)) != pdTRUE) {
+                    incrementRetriedCounter();
+                    ESP_LOGW(TAG, "Requeue busy for EPC %s; retrying", item.epc);
+                }
+                vTaskDelay(pdMS_TO_TICKS(kPublishRetryIntervalMs));
+            } else {
+                incrementPublishedCounter();
+            }
+        }
+    }
+}
 
 std::vector<uint8_t> Yrm100Reader::buildYrm100Frame(uint8_t msg_type, uint8_t cmd_code, const std::vector<uint8_t> &data) {
     std::vector<uint8_t> frame;
@@ -260,11 +362,13 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
     }
 
     char time_buf[16] = {0};
-    // use pre-resolved cache; calling time service here blocks the USB callback
-    std::snprintf(time_buf, sizeof(time_buf), "%s", s_cached_time);
-    if (s_cached_time_src == TimeSource::kFallback && !getSystemTimeHhMmSs(time_buf, sizeof(time_buf))) {
-        std::snprintf(time_buf, sizeof(time_buf), "%lu",
-                     static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
+    // Stamp every event with live wall-clock time to avoid stale 5s cache reuse.
+    if (!getSystemTimeHhMmSs(time_buf, sizeof(time_buf))) {
+        std::snprintf(time_buf, sizeof(time_buf), "%s", s_cached_time);
+        if (s_cached_time_src == TimeSource::kFallback) {
+            std::snprintf(time_buf, sizeof(time_buf), "%lu",
+                         static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS));
+        }
     }
 
     if (s_mqtt_publisher != nullptr) {
@@ -273,13 +377,25 @@ void Yrm100Reader::emitTagFromInventoryFrame(const uint8_t *frame, size_t frame_
                  normalized_epc,
                  time_buf,
                  s_mqtt_publisher->isConnected());
-        if (s_mqtt_publisher->isConnected()) {
+
+        PendingTagPublish item = {};
+        std::snprintf(item.epc, sizeof(item.epc), "%s", normalized_epc);
+        std::snprintf(item.time_buf, sizeof(item.time_buf), "%s", time_buf);
+
+        if (s_tag_publish_queue != nullptr) {
+            while (xQueueSend(s_tag_publish_queue, &item, pdMS_TO_TICKS(20)) != pdTRUE) {
+                incrementRetriedCounter();
+                ESP_LOGW(TAG, "Tag publish queue full; waiting to retain EPC %s", normalized_epc);
+            }
+            incrementQueuedCounter();
+        } else if (s_mqtt_publisher->isConnected()) {
             const bool published = s_mqtt_publisher->publishTag(normalized_epc, time_buf);
             if (!published) {
+                incrementRetriedCounter();
                 ESP_LOGW(TAG, "MQTT publish failed for EPC %s", normalized_epc);
+            } else {
+                incrementPublishedCounter();
             }
-        } else {
-            YRM100_STATUS_LOG("MQTT not connected yet; logged reader event for EPC %s", normalized_epc);
         }
     }
 }
@@ -426,123 +542,178 @@ void Yrm100Reader::rfidTask(void *pvParameters) {
 
     ESP_LOGD(TAG, "Waiting for USB reader...");
 
-    ReaderRxState rx_state = {};
-    rx_state.len = 0;
-    rx_state.consumed = 0;
-    rx_state.valid_frames = 0;
-    rx_state.last_type = 0;
-    rx_state.last_cmd = 0;
-
-    cdc_acm_host_device_config_t dev_cfg = {
-        .connection_timeout_ms = 3000,
-        .out_buffer_size = 64,
-        .in_buffer_size = 64,
-        .event_cb = nullptr,
-        .data_cb = readerDataCallback,
-        .user_arg = &rx_state,
-    };
-
-    CdcAcmDevice *dev = VCP::open(NANJING_QINHENG_MICROE_VID, CH340_PID_1, &dev_cfg, 0);
-    if (dev == nullptr) {
-        ESP_LOGW(TAG, "No YRM100/CH34x reader detected");
-        // Deregister so the VCP client no longer intercepts USB events (e.g. keyboard).
-        if (s_client_handle != nullptr) {
-            usb_host_client_deregister(s_client_handle);
-            s_client_handle = nullptr;
-        }
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    ESP_LOGD(TAG, "Reader device opened; waiting briefly for the USB stack to settle");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    bool got_response = false;
-    bool dtr_state = true;
-    bool rts_state = true;
-    static constexpr std::array<int, 1> baud_rates = {115200};
-    const std::vector<ProbeCommand> setup_sequence = {
-        {"Get Module Info (HW)", buildYrm100Frame(0x00, 0x03, {0x00}), 150, 700, true},
-        {"Set Region (CHN2)", buildYrm100Frame(0x00, 0x07, {0x01}), 150, 700, true},
-        {"Get Power", buildYrm100Frame(0x00, 0xB7, {}), 150, 700, true},
-    };
-
-    for (int baud_rate : baud_rates) {
+    while (true) {
+        ReaderRxState rx_state = {};
         rx_state.len = 0;
         rx_state.consumed = 0;
         rx_state.valid_frames = 0;
         rx_state.last_type = 0;
         rx_state.last_cmd = 0;
-        std::memset(rx_state.data, 0, sizeof(rx_state.data));
 
-        cdc_acm_line_coding_t line_coding = {
-            .dwDTERate = static_cast<uint32_t>(baud_rate),
-            .bCharFormat = 0,
-            .bParityType = 0,
-            .bDataBits = 8,
+        cdc_acm_host_device_config_t dev_cfg = {
+            .connection_timeout_ms = 3000,
+            .out_buffer_size = 64,
+            .in_buffer_size = 64,
+            .event_cb = nullptr,
+            .data_cb = readerDataCallback,
+            .user_arg = &rx_state,
         };
-        esp_err_t err = dev->line_coding_set(&line_coding);
-        if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGW(TAG, "line_coding_set failed for %d baud: %s", baud_rate, esp_err_to_name(err));
-        }
-        err = dev->set_control_line_state(dtr_state, rts_state);
-        if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGW(TAG, "set_control_line_state failed for %d baud with DTR=%d RTS=%d: %s",
-                     baud_rate, dtr_state, rts_state, esp_err_to_name(err));
-        }
-        vTaskDelay(pdMS_TO_TICKS(250));
 
-        ESP_LOGD(TAG, "Running YRM100 setup sequence at %d baud with DTR=%d RTS=%d", baud_rate, dtr_state, rts_state);
-        for (const ProbeCommand &cmd : setup_sequence) {
-            const size_t before_frames = rx_state.valid_frames;
-            err = sendReaderFrame(dev, cmd.name, cmd.frame, 2000);
-            if (err != ESP_OK) {
-                continue;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(cmd.settle_ms));
-            const bool got_frame = waitForNewFrame(&rx_state, before_frames, cmd.wait_ms);
-            if (got_frame) {
-                got_response = true;
-            } else if (cmd.expect_response) {
-                ESP_LOGW(TAG, "No response frame after %s (baud=%d)", cmd.name, baud_rate);
-            }
+        CdcAcmDevice *dev = VCP::open(NANJING_QINHENG_MICROE_VID, CH340_PID_1, &dev_cfg, 0);
+        if (dev == nullptr) {
+            ESP_LOGW(TAG, "No YRM100/CH34x reader detected; retrying");
+            vTaskDelay(pdMS_TO_TICKS(kReaderReconnectDelayMs));
+            continue;
         }
 
-        if (got_response) {
-            break;
-        }
-    }
-
-    processReaderStream(&rx_state);
-    if (!got_response && rx_state.valid_frames == 0) {
-        ESP_LOGW(TAG, "No response bytes received from reader across the tested baud rates");
-    }
-
-    // Align with vendor demo behavior: start multi-read once and parse async
-    // inventory notifications, instead of spamming single-inventory commands.
-    const esp_err_t read_multi_err =
-        sendReaderFrame(dev, "ReadMulti", buildReadMultiFrame(kReadMultiLoopCount), 2000);
-    if (read_multi_err != ESP_OK) {
-        ESP_LOGW(TAG, "ReadMulti command failed: %s; fallback to single inventory polling",
-                 esp_err_to_name(read_multi_err));
-
-        YRM100_STATUS_LOG("Waiting for reader frames on USB (single inventory mode)");
-        while (true) {
-            const esp_err_t inventory_err =
-                sendReaderFrame(dev, "Inventory", buildInventoryFrame(), kInventoryTxTimeoutMs);
-            if (inventory_err != ESP_OK) {
-                ESP_LOGW(TAG, "Inventory command failed: %s", esp_err_to_name(inventory_err));
-                vTaskDelay(pdMS_TO_TICKS(kInventoryErrorBackoffMs));
-                continue;
-            }
-            vTaskDelay(pdMS_TO_TICKS(kInventoryPollIntervalMs));
-        }
-    }
-
-    YRM100_STATUS_LOG("Waiting for reader frames on USB (multi inventory mode)");
-    while (true) {
+        ESP_LOGI(TAG, "YRM100/CH34x reader opened");
+        ESP_LOGD(TAG, "Reader device opened; waiting briefly for the USB stack to settle");
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        bool got_response = false;
+        bool dtr_state = true;
+        bool rts_state = true;
+        static constexpr std::array<int, 1> baud_rates = {115200};
+        const std::vector<ProbeCommand> setup_sequence = {
+            {"Get Module Info (HW)", buildYrm100Frame(0x00, 0x03, {0x00}), 150, 700, true},
+            {"Set Region (CHN2)", buildYrm100Frame(0x00, 0x07, {0x01}), 150, 700, true},
+            {"Get Power", buildYrm100Frame(0x00, 0xB7, {}), 150, 700, true},
+        };
+
+        for (int baud_rate : baud_rates) {
+            rx_state.len = 0;
+            rx_state.consumed = 0;
+            rx_state.valid_frames = 0;
+            rx_state.last_type = 0;
+            rx_state.last_cmd = 0;
+            std::memset(rx_state.data, 0, sizeof(rx_state.data));
+
+            cdc_acm_line_coding_t line_coding = {
+                .dwDTERate = static_cast<uint32_t>(baud_rate),
+                .bCharFormat = 0,
+                .bParityType = 0,
+                .bDataBits = 8,
+            };
+            esp_err_t err = dev->line_coding_set(&line_coding);
+            if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(TAG, "line_coding_set failed for %d baud: %s", baud_rate, esp_err_to_name(err));
+            }
+            err = dev->set_control_line_state(dtr_state, rts_state);
+            if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(TAG, "set_control_line_state failed for %d baud with DTR=%d RTS=%d: %s",
+                         baud_rate, dtr_state, rts_state, esp_err_to_name(err));
+            }
+            vTaskDelay(pdMS_TO_TICKS(250));
+
+            ESP_LOGD(TAG, "Running YRM100 setup sequence at %d baud with DTR=%d RTS=%d", baud_rate, dtr_state, rts_state);
+            for (const ProbeCommand &cmd : setup_sequence) {
+                const size_t before_frames = rx_state.valid_frames;
+                err = sendReaderFrame(dev, cmd.name, cmd.frame, 2000);
+                if (err != ESP_OK) {
+                    continue;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(cmd.settle_ms));
+                const bool got_frame = waitForNewFrame(&rx_state, before_frames, cmd.wait_ms);
+                if (got_frame) {
+                    got_response = true;
+                } else if (cmd.expect_response) {
+                    ESP_LOGW(TAG, "No response frame after %s (baud=%d)", cmd.name, baud_rate);
+                }
+            }
+
+            if (got_response) {
+                break;
+            }
+        }
+
+        processReaderStream(&rx_state);
+        if (!got_response && rx_state.valid_frames == 0) {
+            ESP_LOGW(TAG, "No response bytes received from reader across the tested baud rates");
+        }
+
+        // Align with vendor demo behavior: start multi-read once and parse async
+        // inventory notifications, instead of spamming single-inventory commands.
+        const esp_err_t read_multi_err =
+            sendReaderFrame(dev, "ReadMulti", buildReadMultiFrame(kReadMultiLoopCount), 2000);
+
+        bool need_reopen = false;
+        if (read_multi_err != ESP_OK) {
+            ESP_LOGW(TAG, "ReadMulti command failed: %s; fallback to single inventory polling",
+                     esp_err_to_name(read_multi_err));
+
+            uint32_t consecutive_errors = 0;
+            YRM100_STATUS_LOG("Waiting for reader frames on USB (single inventory mode)");
+            while (true) {
+                const esp_err_t inventory_err =
+                    sendReaderFrame(dev, "Inventory", buildInventoryFrame(), kInventoryTxTimeoutMs);
+                if (inventory_err != ESP_OK) {
+                    consecutive_errors++;
+                    ESP_LOGW(TAG,
+                             "Inventory command failed (%lu/%lu): %s",
+                             static_cast<unsigned long>(consecutive_errors),
+                             static_cast<unsigned long>(kSingleModeMaxConsecutiveErrors),
+                             esp_err_to_name(inventory_err));
+                    if (consecutive_errors >= kSingleModeMaxConsecutiveErrors) {
+                        ESP_LOGW(TAG, "Reader appears offline in single mode; reopening device");
+                        need_reopen = true;
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(kInventoryErrorBackoffMs));
+                    continue;
+                }
+
+                consecutive_errors = 0;
+                vTaskDelay(pdMS_TO_TICKS(kInventoryPollIntervalMs));
+            }
+        } else {
+            uint32_t consecutive_errors = 0;
+            TickType_t last_health_check = xTaskGetTickCount();
+
+            YRM100_STATUS_LOG("Waiting for reader frames on USB (multi inventory mode)");
+            while (true) {
+                const TickType_t now = xTaskGetTickCount();
+                if ((now - last_health_check) >= pdMS_TO_TICKS(kMultiModeHealthCheckMs)) {
+                    const esp_err_t health_err =
+                        sendReaderFrame(dev, "Health(GetPower)", buildYrm100Frame(0x00, 0xB7, {}), 2000);
+                    if (health_err != ESP_OK) {
+                        consecutive_errors++;
+                        ESP_LOGW(TAG,
+                                 "Reader health check failed (%lu/%lu): %s",
+                                 static_cast<unsigned long>(consecutive_errors),
+                                 static_cast<unsigned long>(kMultiModeMaxConsecutiveErrors),
+                                 esp_err_to_name(health_err));
+                        if (consecutive_errors >= kMultiModeMaxConsecutiveErrors) {
+                            ESP_LOGW(TAG, "Reader appears offline in multi mode; reopening device");
+                            need_reopen = true;
+                            break;
+                        }
+                    } else {
+                        consecutive_errors = 0;
+                    }
+                    last_health_check = now;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+        }
+
+        const esp_err_t stop_err = sendReaderFrame(dev, "StopMulti", buildStopMultiFrame(), 1000);
+        if (stop_err != ESP_OK) {
+            ESP_LOGD(TAG, "StopMulti before close returned: %s", esp_err_to_name(stop_err));
+        }
+
+        const esp_err_t close_err = dev->close();
+        if (close_err != ESP_OK) {
+            ESP_LOGW(TAG, "Reader close failed: %s", esp_err_to_name(close_err));
+        }
+        delete dev;
+        dev = nullptr;
+
+        if (!need_reopen) {
+            ESP_LOGW(TAG, "Reader loop ended unexpectedly; reopening device");
+        }
+        vTaskDelay(pdMS_TO_TICKS(kReaderReconnectDelayMs));
     }
 }
 
@@ -582,6 +753,10 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
     };
 
     esp_err_t ret = usb_host_install(&host_config);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "usb_host_install returned ESP_ERR_INVALID_STATE; host already initialized");
+        ret = ESP_OK;
+    }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "usb_host_install failed: %s", esp_err_to_name(ret));
         return ret;
@@ -589,8 +764,22 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
 
     if (!app_config::kEnableRfidReader) {
         YRM100_STATUS_LOG("RFID reader and VCP client disabled");
-        xTaskCreatePinnedToCore(usbLibDaemonTask, "usb_daemon", 4096, nullptr, 10, nullptr, 0);
-        xTaskCreatePinnedToCore(timeUpdateTask, "time_update", 4096, nullptr, 2, nullptr, 0);
+        if (s_usb_daemon_task_handle == nullptr) {
+            const BaseType_t daemon_ok = xTaskCreatePinnedToCore(
+                usbLibDaemonTask, "usb_daemon", 4096, nullptr, 10, &s_usb_daemon_task_handle, 0);
+            if (daemon_ok != pdPASS) {
+                ESP_LOGE(TAG, "Failed to create usb_daemon task");
+                return ESP_FAIL;
+            }
+        }
+        if (s_time_update_task_handle == nullptr) {
+            const BaseType_t time_ok = xTaskCreatePinnedToCore(
+                timeUpdateTask, "time_update", 4096, nullptr, 2, &s_time_update_task_handle, 0);
+            if (time_ok != pdPASS) {
+                ESP_LOGE(TAG, "Failed to create time_update task");
+                return ESP_FAIL;
+            }
+        }
         return ESP_OK;
     }
 
@@ -607,14 +796,70 @@ esp_err_t Yrm100Reader::start(MqttPublisher *mqtt_publisher) {
         },
     };
 
-    ret = usb_host_client_register(&client_config, &s_client_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "usb_host_client_register failed: %s", esp_err_to_name(ret));
-        return ret;
+    if (s_client_handle == nullptr) {
+        ret = ESP_FAIL;
+        for (int attempt = 1; attempt <= 5; ++attempt) {
+            ret = usb_host_client_register(&client_config, &s_client_handle);
+            if (ret == ESP_OK) {
+                break;
+            }
+
+            ESP_LOGW(TAG,
+                     "usb_host_client_register attempt %d/5 failed: %s",
+                     attempt,
+                     esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "usb_host_client_register failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
     }
 
-    xTaskCreatePinnedToCore(usbLibDaemonTask, "usb_daemon", 4096, nullptr, 10, nullptr, 0);
-    xTaskCreatePinnedToCore(rfidTask, "yrm100_task", 8192, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(timeUpdateTask, "time_update", 4096, nullptr, 2, nullptr, 0);
+    if (s_usb_daemon_task_handle == nullptr) {
+        const BaseType_t daemon_ok = xTaskCreatePinnedToCore(
+            usbLibDaemonTask, "usb_daemon", 4096, nullptr, 10, &s_usb_daemon_task_handle, 0);
+        if (daemon_ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create usb_daemon task");
+            return ESP_FAIL;
+        }
+    }
+
+    if (s_rfid_task_handle == nullptr) {
+        const BaseType_t rfid_ok = xTaskCreatePinnedToCore(
+            rfidTask, "yrm100_task", 8192, nullptr, 5, &s_rfid_task_handle, 1);
+        if (rfid_ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create yrm100_task");
+            return ESP_FAIL;
+        }
+    }
+
+    if (s_time_update_task_handle == nullptr) {
+        const BaseType_t time_ok = xTaskCreatePinnedToCore(
+            timeUpdateTask, "time_update", 4096, nullptr, 2, &s_time_update_task_handle, 0);
+        if (time_ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create time_update task");
+            return ESP_FAIL;
+        }
+    }
+
+    if (s_tag_publish_queue == nullptr) {
+        s_tag_publish_queue = xQueueCreate(kTagPublishQueueLen, sizeof(PendingTagPublish));
+        if (s_tag_publish_queue == nullptr) {
+            ESP_LOGE(TAG, "Failed to create tag publish queue");
+            return ESP_FAIL;
+        }
+    }
+
+    if (s_publish_task_handle == nullptr) {
+        const BaseType_t publish_ok = xTaskCreatePinnedToCore(
+            publishTask, "yrm100_pub", 4096, nullptr, 4, &s_publish_task_handle, 1);
+        if (publish_ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create yrm100 publish task");
+            return ESP_FAIL;
+        }
+    }
+
     return ESP_OK;
 }

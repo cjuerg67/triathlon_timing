@@ -11,6 +11,7 @@
 #include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_ppp.h"
 #include "esp_wifi.h"
@@ -18,6 +19,8 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "sys/time.h"
+#include "network_provisioning/manager.h"
+#include "network_provisioning/scheme_ble.h"
 
 namespace {
 static const char *TAG = "transport_manager";
@@ -26,6 +29,7 @@ static bool s_event_loop_initialized = false;
 static bool s_eth_handlers_registered = false;
 static bool s_wifi_handlers_registered = false;
 static bool s_ppp_handlers_registered = false;
+static bool s_wifi_prov_handlers_registered = false;
 
 bool isModemRegistered(int reg_state) {
     return reg_state == 1 || reg_state == 5;
@@ -260,18 +264,18 @@ bool TransportManager::refreshActiveTransport() {
     (void)ensureEthernetConnection();
 
     const TransportType previous = active_transport_;
-    if (wifi_connected_) {
-        if (gprs_gate_reason_ != TransportType::kWifi) {
-            ESP_LOGI(TAG, "GPRS not attempted: Wi-Fi is available");
-            gprs_gate_reason_ = TransportType::kWifi;
-        }
-        active_transport_ = TransportType::kWifi;
-    } else if (ethernet_link_up_ && ethernet_got_ip_) {
+    if (ethernet_link_up_ && ethernet_got_ip_) {
         if (gprs_gate_reason_ != TransportType::kEthernet) {
             ESP_LOGI(TAG, "GPRS not attempted: Ethernet is available");
             gprs_gate_reason_ = TransportType::kEthernet;
         }
         active_transport_ = TransportType::kEthernet;
+    } else if (wifi_connected_) {
+        if (gprs_gate_reason_ != TransportType::kWifi) {
+            ESP_LOGI(TAG, "GPRS not attempted: Wi-Fi is available");
+            gprs_gate_reason_ = TransportType::kWifi;
+        }
+        active_transport_ = TransportType::kWifi;
     } else {
         if (gprs_gate_reason_ != TransportType::kNone) {
             ESP_LOGI(TAG, "No Wi-Fi/LAN available; attempting GPRS now");
@@ -312,6 +316,7 @@ TransportType TransportManager::activeTransport() const {
 }
 
 bool TransportManager::ensureWifiConnection() {
+    wifi_enabled_ = app_config::kEnableWifiTransport;
     if (!wifi_enabled_) {
         ESP_LOGI(TAG, "Wi-Fi transport disabled; skipping initialization");
         return false;
@@ -372,6 +377,15 @@ bool TransportManager::ensureWifiConnection() {
         s_wifi_handlers_registered = true;
     }
 
+    if (!s_wifi_prov_handlers_registered) {
+        ret = esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &TransportManager::wifiProvEventHandler, this);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Register Wi-Fi provisioning event handler failed: %s", esp_err_to_name(ret));
+            return false;
+        }
+        s_wifi_prov_handlers_registered = true;
+    }
+
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ret = esp_wifi_init(&init_cfg);
     if (ret != ESP_OK) {
@@ -385,21 +399,67 @@ bool TransportManager::ensureWifiConnection() {
         return false;
     }
 
-    wifi_config_t wifi_config = {};
-    std::strncpy(reinterpret_cast<char *>(wifi_config.sta.ssid), app_config::kWifiSsid, sizeof(wifi_config.sta.ssid) - 1);
-    std::strncpy(reinterpret_cast<char *>(wifi_config.sta.password), app_config::kWifiPassword, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(ret));
+    ret = esp_wifi_start();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
         return false;
     }
 
-    ret = esp_wifi_start();
+    if (!wifi_prov_mgr_initialized_) {
+        network_prov_mgr_config_t prov_cfg = {};
+        prov_cfg.scheme = network_prov_scheme_ble;
+        prov_cfg.scheme_event_handler = NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM;
+        prov_cfg.app_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE;
+        ret = network_prov_mgr_init(prov_cfg);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "network_prov_mgr_init failed: %s", esp_err_to_name(ret));
+            return false;
+        }
+        wifi_prov_mgr_initialized_ = true;
+    }
+
+    bool provisioned = false;
+    ret = network_prov_mgr_is_wifi_provisioned(&provisioned);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "network_prov_mgr_is_wifi_provisioned failed: %s", esp_err_to_name(ret));
         return false;
+    }
+
+    if (!provisioned) {
+        if (!wifi_provisioning_started_) {
+            ensureProvisioningServiceName();
+#if CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1
+            const network_prov_security_t security = NETWORK_PROV_SECURITY_1;
+#elif CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2
+            const network_prov_security_t security = NETWORK_PROV_SECURITY_2;
+#else
+            const network_prov_security_t security = NETWORK_PROV_SECURITY_0;
+#endif
+            ret = network_prov_mgr_start_provisioning(security,
+                                                      app_config::kWifiProvisioningPop,
+                                                      wifi_prov_service_name_,
+                                                      nullptr);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "network_prov_mgr_start_provisioning failed: %s", esp_err_to_name(ret));
+                return false;
+            }
+
+            wifi_provisioning_started_ = true;
+            ESP_LOGW(TAG,
+                     "Wi-Fi not provisioned. Open Espressif Provisioning App and provision BLE device '%s' (PoP: %s)",
+                     wifi_prov_service_name_,
+                     app_config::kWifiProvisioningPop);
+        }
+
+        wifi_initialized_ = true;
+        return true;
+    }
+
+    wifi_provisioned_ = true;
+
+    if (wifi_prov_mgr_initialized_) {
+        network_prov_mgr_deinit();
+        wifi_prov_mgr_initialized_ = false;
     }
 
     ret = esp_wifi_connect();
@@ -409,8 +469,32 @@ bool TransportManager::ensureWifiConnection() {
     }
 
     wifi_initialized_ = true;
-    ESP_LOGI(TAG, "Wi-Fi transport initialization started for SSID %s", app_config::kWifiSsid);
+    ESP_LOGI(TAG, "Wi-Fi transport initialization started using provisioned credentials from NVS");
     return true;
+}
+
+void TransportManager::ensureProvisioningServiceName() {
+    if (wifi_prov_service_name_[0] != '\0') {
+        return;
+    }
+
+    uint8_t mac[6] = {0};
+    esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
+    if (ret != ESP_OK) {
+        ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    }
+
+    if (ret == ESP_OK) {
+        std::snprintf(wifi_prov_service_name_,
+                      sizeof(wifi_prov_service_name_),
+                      "%s_%02X%02X%02X",
+                      app_config::kWifiProvisioningServicePrefix,
+                      mac[3],
+                      mac[4],
+                      mac[5]);
+    } else {
+        std::snprintf(wifi_prov_service_name_, sizeof(wifi_prov_service_name_), "%s", app_config::kWifiProvisioningServicePrefix);
+    }
 }
 
 bool TransportManager::ensureEthernetConnection() {
@@ -673,11 +757,76 @@ bool TransportManager::ensureGprsConnection() {
     }
 
     if (!modem_synced) {
-        return fail_gprs("Modem sync failed; cannot start PPP", modem_ret);
+        ESP_LOGW(TAG, "Initial SIM7000 sync failed; trying software modem reset recovery");
+        const esp_err_t reset_ret = esp_modem_reset(gprs_dce_);
+        ESP_LOGW(TAG, "esp_modem_reset result: %s", esp_err_to_name(reset_ret));
+
+        // Allow SIM7000 to reboot and re-enable UART responsiveness.
+        vTaskDelay(pdMS_TO_TICKS(6000));
+
+        for (int attempt = 1; attempt <= 10; ++attempt) {
+            modem_ret = esp_modem_sync(gprs_dce_);
+            if (modem_ret == ESP_OK) {
+                modem_synced = true;
+                ESP_LOGI(TAG, "SIM7000 sync successful after reset recovery");
+                break;
+            }
+
+            ESP_LOGW(TAG,
+                     "esp_modem_sync recovery attempt %d/10 failed at %d baud: %s",
+                     attempt,
+                     app_config::kSim7000UartBaudRate,
+                     esp_err_to_name(modem_ret));
+            vTaskDelay(pdMS_TO_TICKS(700));
+        }
+
+        if (!modem_synced) {
+            return fail_gprs("Modem sync failed after reset recovery; cannot start PPP", modem_ret);
+        }
     }
 
     if (!enterCommandModeReady(gprs_dce_)) {
         return fail_gprs("Failed to stabilize SIM7000 command mode after sync");
+    }
+
+    if (!gprs_boot_soft_reset_done_) {
+        gprs_boot_soft_reset_done_ = true;
+        ESP_LOGI(TAG, "Issuing one-time SIM7000 software reboot (AT+CFUN=1,1)");
+
+        char out[ESP_MODEM_C_API_STR_BUF_SIZE] = {0};
+        modem_ret = esp_modem_at(gprs_dce_, "AT+CFUN=1,1", out, 3000);
+        if (modem_ret == ESP_OK) {
+            ESP_LOGI(TAG, "SIM7000 accepted software reboot command; waiting for modem restart");
+            vTaskDelay(pdMS_TO_TICKS(8000));
+
+            bool reboot_synced = false;
+            for (int attempt = 1; attempt <= 10; ++attempt) {
+                modem_ret = esp_modem_sync(gprs_dce_);
+                if (modem_ret == ESP_OK) {
+                    reboot_synced = true;
+                    ESP_LOGI(TAG, "SIM7000 resync successful after software reboot");
+                    break;
+                }
+
+                ESP_LOGW(TAG,
+                         "esp_modem_sync after software reboot attempt %d/10 failed: %s",
+                         attempt,
+                         esp_err_to_name(modem_ret));
+                vTaskDelay(pdMS_TO_TICKS(700));
+            }
+
+            if (!reboot_synced) {
+                return fail_gprs("SIM7000 did not come back after software reboot", modem_ret);
+            }
+
+            if (!enterCommandModeReady(gprs_dce_)) {
+                return fail_gprs("Failed to stabilize command mode after SIM7000 software reboot");
+            }
+        } else {
+            ESP_LOGW(TAG,
+                     "AT+CFUN=1,1 failed (%s); continuing without software reboot",
+                     esp_err_to_name(modem_ret));
+        }
     }
 
     (void)esp_modem_set_apn(gprs_dce_, app_config::kSim7000Apn);
@@ -875,10 +1024,54 @@ void TransportManager::wifiGotIpEventHandler(void *arg, esp_event_base_t event_b
     }
 
     self->wifi_connected_ = true;
-    if (self->wifi_netif_ != nullptr) {
+    if (self->active_transport_ == TransportType::kWifi && self->wifi_netif_ != nullptr) {
         esp_netif_set_default_netif(self->wifi_netif_);
+        ESP_LOGI(TAG, "Wi-Fi station received an IP address and is active transport");
+    } else {
+        ESP_LOGI(TAG,
+                 "Wi-Fi station received an IP address (active transport=%d); keeping current default route",
+                 static_cast<int>(self->active_transport_));
     }
-    ESP_LOGI(TAG, "Wi-Fi station received an IP address");
+}
+
+void TransportManager::wifiProvEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)event_base;
+
+    auto *self = static_cast<TransportManager *>(arg);
+    if (self == nullptr) {
+        return;
+    }
+
+    switch (event_id) {
+    case NETWORK_PROV_START:
+        ESP_LOGI(TAG, "Wi-Fi provisioning started");
+        break;
+    case NETWORK_PROV_WIFI_CRED_RECV: {
+        const wifi_sta_config_t *wifi_sta_cfg = static_cast<const wifi_sta_config_t *>(event_data);
+        if (wifi_sta_cfg != nullptr) {
+            ESP_LOGI(TAG, "Provisioning received Wi-Fi SSID: %s", reinterpret_cast<const char *>(wifi_sta_cfg->ssid));
+        }
+        break;
+    }
+    case NETWORK_PROV_WIFI_CRED_SUCCESS:
+        self->wifi_provisioned_ = true;
+        self->wifi_provisioning_started_ = false;
+        ESP_LOGI(TAG, "Wi-Fi provisioning succeeded");
+        break;
+    case NETWORK_PROV_WIFI_CRED_FAIL:
+        self->wifi_provisioning_started_ = false;
+        ESP_LOGW(TAG, "Wi-Fi provisioning failed; retry in app");
+        break;
+    case NETWORK_PROV_END:
+        if (self->wifi_prov_mgr_initialized_) {
+            network_prov_mgr_deinit();
+            self->wifi_prov_mgr_initialized_ = false;
+        }
+        ESP_LOGI(TAG, "Wi-Fi provisioning ended");
+        break;
+    default:
+        break;
+    }
 }
 
 void TransportManager::ethEventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
