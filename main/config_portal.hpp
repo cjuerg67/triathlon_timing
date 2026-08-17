@@ -3,10 +3,13 @@
 #include "esp_http_server.h"
 #include "esp_err.h"
 
+class TransportManager;
+
 class ConfigPortal {
 public:
     esp_err_t start(bool start_soft_ap = false);
     bool isRunning() const;
+    void setTransportManager(TransportManager *transport_manager);
 
 private:
     esp_err_t startSoftAp();

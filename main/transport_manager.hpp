@@ -17,6 +17,7 @@ public:
     bool connectAny();
     bool refreshActiveTransport();
     TransportType activeTransport() const;
+    int getCurrentGprsRssiDbm() const;
 
 private:
     bool ensureWifiConnection();

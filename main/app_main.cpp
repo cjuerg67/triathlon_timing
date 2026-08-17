@@ -62,6 +62,7 @@ extern "C" void app_main(void) {
     static CfE714Reader cf_e714_reader;
     static KeyboardReader keyboard_reader;
     static ConfigPortal config_portal;
+    config_portal.setTransportManager(&transport_manager);
 
     if (runtime_settings::init() != ESP_OK) {
         ESP_LOGW(TAG, "Runtime settings init failed; using compile-time MQTT defaults");

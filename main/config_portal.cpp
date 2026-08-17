@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "app_config.hpp"
 #include "esp_event.h"
@@ -13,6 +14,7 @@
 #include "freertos/task.h"
 #include "lwip/ip4_addr.h"
 #include "runtime_settings.hpp"
+#include "transport_manager.hpp"
 
 namespace {
 static const char *TAG = "config_portal";
@@ -20,6 +22,7 @@ static ConfigPortal *s_instance = nullptr;
 static httpd_handle_t s_server = nullptr;
 static esp_netif_t *s_ap_netif = nullptr;
 static bool s_running = false;
+static TransportManager *s_transport_manager = nullptr;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 extern const unsigned char servercert_pem_start[] asm("_binary_servercert_pem_start");
@@ -33,18 +36,78 @@ static const char kHtmlPage[] =
     "<title>Triathlon Config</title>"
     "<style>body{font-family:Verdana,sans-serif;background:#f2efe8;margin:0;padding:24px;}"
     "main{max-width:520px;margin:auto;background:#fff;padding:20px;border-radius:12px;box-shadow:0 10px 28px rgba(0,0,0,.08);}"
-    "h1{margin-top:0;color:#223;}label{display:block;margin:14px 0 6px;}input{width:100%;padding:10px;border:1px solid #bbb;border-radius:8px;}"
+    "h1{margin-top:0;color:#223;}h2{margin:18px 0 8px;color:#234;font-size:1.05rem;}label{display:block;margin:14px 0 6px;}input{width:100%;padding:10px;border:1px solid #bbb;border-radius:8px;}"
     "button{margin-top:16px;padding:10px 14px;border:0;border-radius:8px;background:#1f6f8b;color:#fff;font-weight:700;}"
-    "small{color:#666;display:block;margin-top:8px;}#msg{margin-top:12px;min-height:20px;color:#164;}</style></head><body><main>"
+    "small{color:#666;display:block;margin-top:8px;}#msg{margin-top:12px;min-height:20px;color:#164;}#infoBox{display:grid;gap:8px;}#infoBox>div{padding:10px 12px;border:1px solid #d6d6d6;border-radius:8px;background:#f8f9fa;color:#223;}</style></head><body><main>"
     "<h1>MQTT Runtime Config</h1>"
+    "<section><h2>Infos</h2><div id='infoBox'><div id='wifi_rssi'>Wi‑Fi RSSI: loading...</div><div id='gprs_rssi'>GPRS RSSI: loading...</div><div id='cpu_busy'>CPU busy: loading...</div><div id='device_time'>Time: loading...</div></div></section>"
     "<form id='cfgForm'><label>MQTT IP for Wi-Fi/LAN</label><input id='lan_ip' name='lan_ip' required pattern='[0-9.]{7,15}'>"
     "<label>MQTT IP for GPRS</label><input id='gprs_ip' name='gprs_ip' required pattern='[0-9.]{7,15}'>"
     "<button type='submit'>Save</button><div id='msg'></div></form>"
-    "<script>async function load(){const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();"
-    "lan_ip.value=j.lan_ip||'';gprs_ip.value=j.gprs_ip||'';}"
+    "<script>const wifiRssi=document.getElementById('wifi_rssi');const gprsRssi=document.getElementById('gprs_rssi');const cpuBusy=document.getElementById('cpu_busy');const deviceTime=document.getElementById('device_time');async function load(){const r=await fetch('/api/config');if(!r.ok)return;const j=await r.json();"
+    "lan_ip.value=j.lan_ip||'';gprs_ip.value=j.gprs_ip||'';const wifiRssiValue=Number(j.wifi_rssi_dbm);wifiRssi.textContent=(Number.isFinite(wifiRssiValue)&&wifiRssiValue>-127)?('Wi‑Fi RSSI: '+wifiRssiValue+' dBm'):'Wi‑Fi RSSI: not connected';"
+    "const gprsRssiValue=Number(j.gprs_rssi_dbm);gprsRssi.textContent=(Number.isFinite(gprsRssiValue)&&gprsRssiValue>-127)?('GPRS RSSI: '+gprsRssiValue+' dBm'):'GPRS RSSI: not connected';"
+    "const cpuBusyValue=Number(j.cpu_busy_percent);cpuBusy.textContent=(Number.isFinite(cpuBusyValue)&&cpuBusyValue>=0)?('CPU busy: '+cpuBusyValue+'%'):'CPU busy: unavailable';"
+    "deviceTime.textContent=(j.time_valid&&j.time)?('Time: '+j.time):'Time: not synchronized';}"
     "cfgForm.addEventListener('submit',async(e)=>{e.preventDefault();const b=new URLSearchParams(new FormData(cfgForm));"
     "const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});"
-    "msg.textContent=await r.text();});load();</script></main></body></html>";
+    "msg.textContent=await r.text();});load();setInterval(load,5000);</script></main></body></html>";
+
+static int currentWifiRssiDbm() {
+    int rssi = -127;
+    const esp_err_t ret = esp_wifi_sta_get_rssi(&rssi);
+    if (ret != ESP_OK) {
+        return -127;
+    }
+    return rssi;
+}
+
+static bool currentTimeString(char *out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return false;
+    }
+
+    const std::time_t now = std::time(nullptr);
+    const std::tm *tm_now = std::localtime(&now);
+    if (tm_now == nullptr || (tm_now->tm_year + 1900) < 2024) {
+        out[0] = '\0';
+        return false;
+    }
+
+    const size_t written = std::strftime(out, out_size, "%Y-%m-%d %H:%M:%S", tm_now);
+    return written != 0;
+}
+
+#if defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS > 0)
+static int currentCpuBusyPercent() {
+    TaskStatus_t tasks[16] = {};
+    UBaseType_t task_count = uxTaskGetSystemState(tasks, static_cast<UBaseType_t>(std::size(tasks)), nullptr);
+    if (task_count == 0) {
+        return -1;
+    }
+
+    uint32_t total_runtime = 0;
+    uint32_t idle_runtime = 0;
+    for (UBaseType_t i = 0; i < task_count; ++i) {
+        total_runtime += tasks[i].ulRunTimeCounter;
+        if (std::strcmp(tasks[i].pcTaskName, "IDLE") == 0) {
+            idle_runtime = tasks[i].ulRunTimeCounter;
+        }
+    }
+
+    if (total_runtime == 0) {
+        return -1;
+    }
+
+    const uint32_t busy_runtime = total_runtime > idle_runtime ? total_runtime - idle_runtime : 0;
+    const int busy_percent = static_cast<int>((busy_runtime * 100u) / total_runtime);
+    return std::max(0, std::min(100, busy_percent));
+}
+#else
+static int currentCpuBusyPercent() {
+    return -1;
+}
+#endif
 
 bool isValidIpv4(const char *ip) {
     if (ip == nullptr || ip[0] == '\0') {
@@ -109,6 +172,10 @@ bool checkAuth(httpd_req_t *req) {
 }
 
 }  // namespace
+
+void ConfigPortal::setTransportManager(TransportManager *transport_manager) {
+    s_transport_manager = transport_manager;
+}
 
 bool ConfigPortal::isRunning() const {
     taskENTER_CRITICAL(&s_lock);
@@ -305,8 +372,22 @@ esp_err_t ConfigPortal::configGetHandler(httpd_req_t *req) {
     char gprs_ip[32] = {0};
     runtime_settings::getBrokerIps(lan_ip, sizeof(lan_ip), gprs_ip, sizeof(gprs_ip));
 
-    char resp[160] = {0};
-    std::snprintf(resp, sizeof(resp), "{\"lan_ip\":\"%s\",\"gprs_ip\":\"%s\"}", lan_ip, gprs_ip);
+    const int wifi_rssi_dbm = currentWifiRssiDbm();
+    const int gprs_rssi_dbm = (s_transport_manager != nullptr) ? s_transport_manager->getCurrentGprsRssiDbm() : -127;
+    const int cpu_busy_percent = currentCpuBusyPercent();
+    char time_buf[32] = {0};
+    const bool time_valid = currentTimeString(time_buf, sizeof(time_buf));
+
+    char resp[360] = {0};
+    std::snprintf(resp, sizeof(resp),
+                  "{\"lan_ip\":\"%s\",\"gprs_ip\":\"%s\",\"wifi_rssi_dbm\":%d,\"gprs_rssi_dbm\":%d,\"cpu_busy_percent\":%d,\"time_valid\":%s,\"time\":\"%s\"}",
+                  lan_ip,
+                  gprs_ip,
+                  wifi_rssi_dbm,
+                  gprs_rssi_dbm,
+                  cpu_busy_percent,
+                  time_valid ? "true" : "false",
+                  time_valid ? time_buf : "");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;

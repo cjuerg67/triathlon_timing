@@ -2,8 +2,25 @@
 
 #include <cstdint>
 
-namespace app_config {
+#include "esp_timer.h"
 
+#ifndef configGENERATE_RUN_TIME_STATS
+  #define configGENERATE_RUN_TIME_STATS 1
+#endif
+#ifndef configUSE_TRACE_FACILITY
+  #define configUSE_TRACE_FACILITY 1
+#endif
+#ifndef configUSE_STATS_FORMATTING_FUNCTIONS
+  #define configUSE_STATS_FORMATTING_FUNCTIONS 1
+#endif
+#ifndef configRUN_TIME_COUNTER_TYPE
+  #define configRUN_TIME_COUNTER_TYPE uint64_t
+#endif
+#ifndef portGET_RUN_TIME_COUNTER_VALUE
+  #define portGET_RUN_TIME_COUNTER_VALUE() static_cast<configRUN_TIME_COUNTER_TYPE>(esp_timer_get_time())
+#endif
+
+namespace app_config {
     // Runtime config portal (SoftAP + HTTPS)
     // Enabled: the portal starts only after a valid Wi‑Fi or LAN connection is established.
     static constexpr bool kEnableConfigPortal = true;

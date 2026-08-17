@@ -315,6 +315,20 @@ TransportType TransportManager::activeTransport() const {
     return active_transport_;
 }
 
+int TransportManager::getCurrentGprsRssiDbm() const {
+    if (gprs_dce_ == nullptr) {
+        return -127;
+    }
+
+    int rssi = -127;
+    int ber = 0;
+    const esp_err_t ret = esp_modem_get_signal_quality(gprs_dce_, &rssi, &ber);
+    if (ret != ESP_OK) {
+        return -127;
+    }
+    return rssi;
+}
+
 bool TransportManager::ensureWifiConnection() {
     wifi_enabled_ = app_config::kEnableWifiTransport;
     if (!wifi_enabled_) {
