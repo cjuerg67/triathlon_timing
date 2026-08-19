@@ -99,8 +99,112 @@ static bool getSystemTimeHhMmSs(char *out, size_t out_size) {
     return true;
 }
 
-// Parse the EPC list from a validated inventory response and publish each tag.
-// 'payload' starts at Status byte; 'payload_len' is the count of bytes from Status to end of CRC.
+// Send a configuration command and read the response.
+// Returns true if the command succeeded (Status = 0x00).
+static bool sendConfigCommand(uart_port_t port, const uint8_t *cmd, size_t cmd_len,
+                              const char *cmd_name) {
+    uart_flush(port);
+    uart_write_bytes(port, cmd, cmd_len);
+
+    uint8_t resp[16];
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(500);
+    if (!uartReadExact(port, resp, 1, deadline)) {
+        ESP_LOGW(TAG, "%s: no response (timeout reading Len)", cmd_name);
+        return false;
+    }
+
+    const uint8_t len = resp[0];
+    if (len < 5 || len > 15) {
+        ESP_LOGW(TAG, "%s: invalid response length %d", cmd_name, len);
+        return false;
+    }
+
+    if (!uartReadExact(port, resp + 1, len, deadline)) {
+        ESP_LOGW(TAG, "%s: timeout reading response body", cmd_name);
+        return false;
+    }
+
+    // Verify CRC
+    const uint16_t rx_crc = static_cast<uint16_t>(resp[len - 1]) |
+                             (static_cast<uint16_t>(resp[len]) << 8);
+    const uint16_t calc_crc = crc16(&resp[1], len - 2);
+    if (rx_crc != calc_crc) {
+        ESP_LOGW(TAG, "%s: CRC mismatch", cmd_name);
+        return false;
+    }
+
+    // Check status byte (resp[3])
+    if (resp[3] != 0x00) {
+        ESP_LOGW(TAG, "%s: command failed with status 0x%02X", cmd_name, resp[3]);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "%s: success", cmd_name);
+    return true;
+}
+
+// Configure CF-E714 RF settings using the CHAFON UHFReader288 protocol.
+// Commands: 0x22 (region/frequency), 0x2f (RF power), 0x3f (antenna multiplexing).
+static bool configureReaderDefaults(uart_port_t port) {
+    const int country_code = app_config::kCfE714CountryCode;
+    const int output_power_dbm = app_config::kCfE714OutputPowerDbm;
+    const int antenna_port = app_config::kCfE714AntennaPort;
+
+    if (country_code == 0 && output_power_dbm == 0 && antenna_port == 0) {
+        ESP_LOGI(TAG, "CF-E714 RF settings left at factory defaults (all zero)");
+        return true;
+    }
+
+    ESP_LOGI(TAG, "Configuring CF-E714: region=%d power=%d dBm antenna=0x%02X",
+             country_code, output_power_dbm, antenna_port);
+
+    bool all_ok = true;
+
+    // Command 0x22: Modify working frequency (region)
+    // Frame: [Len][ComAdr][0x22][MaxFre][MinFre][CRC_L][CRC_H]
+    // For EU band (code 4): MaxFre=0x8E (bit7-6=01, bit5-0=14), MinFre=0x40 (bit7-6=01, bit5-0=0)
+    if (country_code != 0) {
+        const uint8_t max_fre = static_cast<uint8_t>((country_code << 6) | 0x0E); // EU: band 4, max point 14
+        const uint8_t min_fre = static_cast<uint8_t>((country_code << 6) | 0x00); // EU: band 4, min point 0
+        uint8_t data[4] = {kComAddr, 0x22, max_fre, min_fre};
+        const uint16_t crc = crc16(data, 4);
+        uint8_t cmd[7] = {0x06, data[0], data[1], data[2], data[3],
+                          static_cast<uint8_t>(crc & 0xFF), static_cast<uint8_t>(crc >> 8)};
+        if (!sendConfigCommand(port, cmd, sizeof(cmd), "SetRegion")) {
+            all_ok = false;
+        }
+    }
+
+    // Command 0x2f: Modify RF power
+    // Frame: [Len][ComAdr][0x2f][Pwr][CRC_L][CRC_H]
+    // Pwr: 0-30 (30 = ~1W)
+    if (output_power_dbm > 0) {
+        const uint8_t pwr = static_cast<uint8_t>(output_power_dbm > 30 ? 30 : output_power_dbm);
+        uint8_t data[3] = {kComAddr, 0x2f, pwr};
+        const uint16_t crc = crc16(data, 3);
+        uint8_t cmd[6] = {0x05, data[0], data[1], data[2],
+                          static_cast<uint8_t>(crc & 0xFF), static_cast<uint8_t>(crc >> 8)};
+        if (!sendConfigCommand(port, cmd, sizeof(cmd), "SetRfPower")) {
+            all_ok = false;
+        }
+    }
+
+    // Command 0x3f: Setup antenna multiplexing (Format 1)
+    // Frame: [Len][ComAdr][0x3f][Ant][CRC_L][CRC_H]
+    // Ant: bit0=ant1, bit1=ant2, bit2=ant3, bit3=ant4, etc.
+    if (antenna_port != 0) {
+        uint8_t data[3] = {kComAddr, 0x3f, static_cast<uint8_t>(antenna_port)};
+        const uint16_t crc = crc16(data, 3);
+        uint8_t cmd[6] = {0x05, data[0], data[1], data[2],
+                          static_cast<uint8_t>(crc & 0xFF), static_cast<uint8_t>(crc >> 8)};
+        if (!sendConfigCommand(port, cmd, sizeof(cmd), "SetAntenna")) {
+            all_ok = false;
+        }
+    }
+
+    return all_ok;
+}
+
 static void processInventoryResponse(const uint8_t *payload, size_t payload_len,
                                      MqttPublisher *publisher,
                                      const char *cached_time, TimeSource cached_src) {
@@ -188,6 +292,8 @@ void CfE714Reader::readerTask(void *pvParameters) {
     }
     ESP_LOGI(TAG, "CF-E714 reader started on UART%d baud=%d",
              app_config::kCfE714UartPort, app_config::kCfE714BaudRate);
+
+    (void)configureReaderDefaults(port);
 
     uint8_t cmd[19];
     uint8_t resp[256];

@@ -2,23 +2,9 @@
 
 #include <cstdint>
 
-#include "esp_timer.h"
-
-#ifndef configGENERATE_RUN_TIME_STATS
-  #define configGENERATE_RUN_TIME_STATS 1
-#endif
-#ifndef configUSE_TRACE_FACILITY
-  #define configUSE_TRACE_FACILITY 1
-#endif
-#ifndef configUSE_STATS_FORMATTING_FUNCTIONS
-  #define configUSE_STATS_FORMATTING_FUNCTIONS 1
-#endif
-#ifndef configRUN_TIME_COUNTER_TYPE
-  #define configRUN_TIME_COUNTER_TYPE uint64_t
-#endif
-#ifndef portGET_RUN_TIME_COUNTER_VALUE
-  #define portGET_RUN_TIME_COUNTER_VALUE() static_cast<configRUN_TIME_COUNTER_TYPE>(esp_timer_get_time())
-#endif
+// Runtime stats are enabled via sdkconfig.defaults and should use the FreeRTOS
+// definitions provided by ESP-IDF. Do not redefine the port macros here because
+// the IDF port header already provides them and redefinition raises build errors.
 
 namespace app_config {
     // Runtime config portal (SoftAP + HTTPS)
@@ -97,5 +83,13 @@ namespace app_config {
     static constexpr int kCfE714TxPin = 10;
     static constexpr int kCfE714RxPin = 11;
     static constexpr int kCfE714BaudRate = 57600;
+
+    // CF-E714 RF configuration (CHAFON UHFReader288 protocol)
+    // Region/frequency band: 0=factory default, 1=CN2, 2=US, 3=KR, 4=EU, 6=Ukraine, 7=Peru, 8=CN1, 9=EU3, 10=TW, 12=US3
+    // Output power: 0=factory default, 1-30 (30 = ~1W)
+    // Antenna port bitmap: bit0=ant1, bit1=ant2, bit2=ant3, bit3=ant4 (e.g., 0x01 = antenna 1 only)
+    static constexpr int kCfE714CountryCode = 4;      // EU band (865.1-867.9 MHz)
+    static constexpr int kCfE714OutputPowerDbm = 30;  // Maximum power (~1W)
+    static constexpr int kCfE714AntennaPort = 0x01;   // Antenna 1 enabled
 
 }  // namespace app_config
