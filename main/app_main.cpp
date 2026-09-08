@@ -45,6 +45,7 @@ void brokerForTransport(TransportType transport, char *out, size_t out_size) {
         runtime_settings::getLanBrokerUri(out, out_size);
     }
 }
+
 }
 
 extern "C" void app_main(void) {

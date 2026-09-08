@@ -103,17 +103,51 @@ static bool getSystemTimeHhMmSs(char *out, size_t out_size) {
 // Returns true if the command succeeded (Status = 0x00).
 static bool sendConfigCommand(uart_port_t port, const uint8_t *cmd, size_t cmd_len,
                               const char *cmd_name) {
+    // Flush and give reader time to settle
     uart_flush(port);
-    uart_write_bytes(port, cmd, cmd_len);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Log the command bytes being sent
+    ESP_LOGI(TAG, "%s: sending %zu bytes:", cmd_name, cmd_len);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, cmd, cmd_len, ESP_LOG_INFO);
+    
+    const int written = uart_write_bytes(port, cmd, cmd_len);
+    if (written < 0) {
+        ESP_LOGW(TAG, "%s: uart_write_bytes failed", cmd_name);
+        return false;
+    }
+    
+    // Wait for transmission to complete
+    uart_wait_tx_done(port, pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Check if ANY bytes are available
+    size_t available = 0;
+    uart_get_buffered_data_len(port, &available);
+    ESP_LOGI(TAG, "%s: %zu bytes available in RX buffer after TX", cmd_name, available);
 
     uint8_t resp[16];
-    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(500);
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
     if (!uartReadExact(port, resp, 1, deadline)) {
-        ESP_LOGW(TAG, "%s: no response (timeout reading Len)", cmd_name);
+        // Check again if data arrived late
+        uart_get_buffered_data_len(port, &available);
+        ESP_LOGW(TAG, "%s: no response (timeout reading Len), %zu bytes in buffer", cmd_name, available);
+        
+        // Dump any garbage that might be in buffer
+        if (available > 0) {
+            uint8_t garbage[32];
+            const size_t to_read = available < sizeof(garbage) ? available : sizeof(garbage);
+            const int n = uart_read_bytes(port, garbage, to_read, pdMS_TO_TICKS(100));
+            if (n > 0) {
+                ESP_LOGW(TAG, "%s: received unexpected data:", cmd_name);
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, garbage, n, ESP_LOG_WARN);
+            }
+        }
         return false;
     }
 
     const uint8_t len = resp[0];
+    ESP_LOGI(TAG, "%s: received Len byte = 0x%02X", cmd_name, len);
     if (len < 5 || len > 15) {
         ESP_LOGW(TAG, "%s: invalid response length %d", cmd_name, len);
         return false;
@@ -129,7 +163,7 @@ static bool sendConfigCommand(uart_port_t port, const uint8_t *cmd, size_t cmd_l
                              (static_cast<uint16_t>(resp[len]) << 8);
     const uint16_t calc_crc = crc16(&resp[1], len - 2);
     if (rx_crc != calc_crc) {
-        ESP_LOGW(TAG, "%s: CRC mismatch", cmd_name);
+        ESP_LOGW(TAG, "%s: CRC mismatch (rx=0x%04X calc=0x%04X)", cmd_name, rx_crc, calc_crc);
         return false;
     }
 
@@ -277,22 +311,97 @@ void CfE714Reader::readerTask(void *pvParameters) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .rx_flow_ctrl_thresh = 0,
         .source_clk = UART_SCLK_DEFAULT,
-        .flags = {.allow_pd = 0, .backup_before_sleep = 0},
+        .flags = {},
     };
 
-    if (uart_driver_install(port, kRxBufSize, 256, 0, nullptr, 0) != ESP_OK ||
-        uart_param_config(port, &uart_cfg) != ESP_OK ||
-        uart_set_pin(port,
-                     app_config::kCfE714TxPin,
-                     app_config::kCfE714RxPin,
-                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
-        ESP_LOGE(TAG, "CF-E714 UART init failed");
+    // Official ESP-IDF pattern: install -> config -> pins
+    // Reference: examples/peripherals/uart/uart_async_rxtxtasks
+    if (uart_driver_install(port, kRxBufSize, 256, 0, nullptr, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "CF-E714 UART driver install failed");
         vTaskDelete(nullptr);
         return;
     }
-    ESP_LOGI(TAG, "CF-E714 reader started on UART%d baud=%d",
-             app_config::kCfE714UartPort, app_config::kCfE714BaudRate);
 
+    if (uart_param_config(port, &uart_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "CF-E714 UART param config failed");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (uart_set_pin(port,
+                     app_config::kCfE714TxPin,
+                     app_config::kCfE714RxPin,
+                     UART_PIN_NO_CHANGE, 
+                     UART_PIN_NO_CHANGE) != ESP_OK) {
+        ESP_LOGE(TAG, "CF-E714 UART pin config failed");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "CF-E714 reader started on UART%d baud=%d TX=%d RX=%d",
+             app_config::kCfE714UartPort, app_config::kCfE714BaudRate,
+             app_config::kCfE714TxPin, app_config::kCfE714RxPin);
+
+    // Optional: UART loopback self-test (requires TX+RX shorted together temporarily)
+    // Uncomment to verify UART hardware is working:
+    /*
+    ESP_LOGI(TAG, "UART loopback test (TX and RX must be connected)...");
+    uart_flush(port);
+    const char *test_msg = "TEST";
+    uart_write_bytes(port, test_msg, 4);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uint8_t loopback_buf[8];
+    int loopback_read = uart_read_bytes(port, loopback_buf, 4, pdMS_TO_TICKS(500));
+    if (loopback_read == 4 && memcmp(loopback_buf, test_msg, 4) == 0) {
+        ESP_LOGI(TAG, "UART loopback test PASSED - UART hardware is working");
+    } else {
+        ESP_LOGE(TAG, "UART loopback test FAILED - read %d bytes", loopback_read);
+    }
+    uart_flush(port);
+    */
+
+    // Wait for reader hardware to stabilize after power-on/UART init
+    ESP_LOGI(TAG, "Waiting 2s for CF-E714 reader to boot...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Flush any garbage data from buffer
+    uart_flush(port);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Try a simple command first to verify communication
+    ESP_LOGI(TAG, "Testing CF-E714 communication with GetReaderInfo command (0x21)...");
+    {
+        uint8_t data[2] = {kComAddr, 0x21};  // 0x21 = Get Reader Info
+        const uint16_t crc = crc16(data, 2);
+        uint8_t test_cmd[5] = {0x04, data[0], data[1],
+                               static_cast<uint8_t>(crc & 0xFF), 
+                               static_cast<uint8_t>(crc >> 8)};
+        
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, test_cmd, sizeof(test_cmd), ESP_LOG_INFO);
+        uart_write_bytes(port, test_cmd, sizeof(test_cmd));
+        uart_wait_tx_done(port, pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(200));
+        
+        size_t available = 0;
+        uart_get_buffered_data_len(port, &available);
+        ESP_LOGI(TAG, "GetReaderInfo: %zu bytes available in RX buffer", available);
+        
+        if (available > 0) {
+            uint8_t test_resp[64];
+            const int n = uart_read_bytes(port, test_resp, available < 64 ? available : 64, pdMS_TO_TICKS(200));
+            if (n > 0) {
+                ESP_LOGI(TAG, "GetReaderInfo response:");
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, test_resp, n, ESP_LOG_INFO);
+            }
+        } else {
+            ESP_LOGW(TAG, "No response to GetReaderInfo - reader may not be connected/powered");
+        }
+        
+        uart_flush(port);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGI(TAG, "Attempting CF-E714 RF configuration...");
     (void)configureReaderDefaults(port);
 
     uint8_t cmd[19];

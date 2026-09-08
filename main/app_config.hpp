@@ -49,14 +49,29 @@ namespace app_config {
     static constexpr uint32_t kYrm100MinEpcBytes = 8;
     static constexpr uint32_t kYrm100ConfirmWindowMs = 700;
     static constexpr uint32_t kYrm100RequiredSightings = 2;
-    static constexpr bool kEnableRfidReader = true;
-    static constexpr bool kEnableCfE714Reader = false;
+    static constexpr bool kEnableRfidReader = false;
+    static constexpr bool kEnableCfE714Reader = true;  // Re-enabled with fixed UART init
     static constexpr bool kEnableGprsTransport = true;
     static constexpr bool kEnableVerboseTransportLogs = false;
     static constexpr bool kEnableYrm100StatusLogs = false;
     static constexpr uint32_t kTransportRefreshIntervalMs = 3000;
     static constexpr const char *kNtpServer = "pool.ntp.org";
     static constexpr const char *kTimezone = "CET-1CEST,M3.5.0,M10.5.0/3";
+
+    // CF-E714 TTL RFID reader — adjust pins to match your board wiring
+    // Using GPIO 20/21 for Waveshare ESP32-P4-WIFI6-DEV-KIT
+    static constexpr int kCfE714UartPort = 2;
+    static constexpr int kCfE714RxPin = 25;
+    static constexpr int kCfE714TxPin = 22;
+    static constexpr int kCfE714BaudRate = 57600;
+
+    // CF-E714 RF configuration (CHAFON UHFReader288 protocol)
+    // Region/frequency band: 0=factory default, 1=CN2, 2=US, 3=KR, 4=EU, 6=Ukraine, 7=Peru, 8=CN1, 9=EU3, 10=TW, 12=US3
+    // Output power: 0=factory default, 1-30 (30 = ~1W)
+    // Antenna port bitmap: bit0=ant1, bit1=ant2, bit2=ant3, bit3=ant4 (e.g., 0x01 = antenna 1 only)
+    static constexpr int kCfE714CountryCode = 4;      // EU band (865.1-867.9 MHz)
+    static constexpr int kCfE714OutputPowerDbm = 10;  // Maximum power (~1W)
+    static constexpr int kCfE714AntennaPort = 0x01;   // Antenna 1 enabled
 
     // Single HD44780 16x2 with PCF8574 backpack (typical address 0x27).
     static constexpr int kStatusLcdI2cPort = 0;
@@ -70,26 +85,12 @@ namespace app_config {
     static constexpr uint32_t kStatusLcdUpdateIntervalMs = 500;
 
     // SIM7000 GPRS modem — adjust pins to match your board wiring
-    static constexpr int kSim7000UartPort = 2;
-    static constexpr int kSim7000UartTxPin = 25;
-    static constexpr int kSim7000UartRxPin = 22;
+    static constexpr int kSim7000UartPort = 1;
+    static constexpr int kSim7000UartTxPin = 20;
+    static constexpr int kSim7000UartRxPin = 21;
     static constexpr int kSim7000UartBaudRate = 115200;
     static constexpr const char *kSim7000Apn = "iot.1nce.net";
     static constexpr const char *kSim7000ApnUser = "";
     static constexpr const char *kSim7000ApnPassword = "";
-
-    // CF-E714 TTL RFID reader — adjust pins to match your board wiring
-    static constexpr int kCfE714UartPort = 1;
-    static constexpr int kCfE714TxPin = 10;
-    static constexpr int kCfE714RxPin = 11;
-    static constexpr int kCfE714BaudRate = 57600;
-
-    // CF-E714 RF configuration (CHAFON UHFReader288 protocol)
-    // Region/frequency band: 0=factory default, 1=CN2, 2=US, 3=KR, 4=EU, 6=Ukraine, 7=Peru, 8=CN1, 9=EU3, 10=TW, 12=US3
-    // Output power: 0=factory default, 1-30 (30 = ~1W)
-    // Antenna port bitmap: bit0=ant1, bit1=ant2, bit2=ant3, bit3=ant4 (e.g., 0x01 = antenna 1 only)
-    static constexpr int kCfE714CountryCode = 4;      // EU band (865.1-867.9 MHz)
-    static constexpr int kCfE714OutputPowerDbm = 30;  // Maximum power (~1W)
-    static constexpr int kCfE714AntennaPort = 0x01;   // Antenna 1 enabled
 
 }  // namespace app_config
